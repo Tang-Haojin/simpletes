@@ -1,5 +1,5 @@
 <p align="center">  
-<img src="picture/will-typography-c.png" alt="WILL" height="66">
+<img src="picture/affiliations.png" alt="WILL" height="66">
 </p>
 
 ---
@@ -337,6 +337,14 @@ picture/                 README and branding images
 ## Scope Note
 
 The accompanying paper also studies learning from successful discovery trajectories. This repository is centered on the **search/runtime side** of SimpleTES: generation, evaluation, scheduling, selectors, task packaging, and released result artifacts.
+
+## Community
+
+Join the SimpleTES community to discuss usage, share research progress, and send feedback. Scan the QR code below to join the chat group:
+
+<p align="center">
+  <img src="picture/chat.jpg" alt="SimpleTES community chat" width="280">
+</p>
 
 ## License
 

@@ -198,7 +198,7 @@ Contributions are welcome.
 | **Evaluations error on imports** | Pin the task-local venv with `--eval-venv <path>`; SimpleTES auto-detects `datasets/<family>/venv/` when present. |
 | **Hitting rate limits** | Lower `--gen-concurrency`, raise `--retry`, or switch to a lower-latency model. |
 | **Evaluations time out** | Raise `--eval-timeout` for slow compilers / simulators. The task-level default lives in each evaluator as `TIMEOUT_SECONDS` and can be overridden per-evaluation via `EVALUATOR_TIMEOUT_SECONDS`. |
-| **GPU-kernel tasks (`gpumode`, `kernelbench`) hang** | Make sure the compiler server is running first — see the family `README.md` for the launch command. |
+| **GPU-kernel tasks (`gpukernel`) hang** | Make sure the compiler server is running first — see the family `README.md` for the launch command. |
 | **`fcntl` import error** (Windows) | The registry script `scripts/evolve_db_registry.py` is POSIX-only by design. Other tasks run fine on Windows. |
 
 </details>

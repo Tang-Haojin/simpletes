@@ -29,12 +29,9 @@
     <td align="center">1</td><td align="center">Python</td>
     <td align="center"><sub>family venv</sub></td></tr>
 
-<tr><td rowspan="2"><b>⚡ GPU kernel optimization</b></td>
-    <td><a href="gpumode"><code>gpumode</code></a></td>
-    <td align="center">1</td><td align="center">CUDA / Torch</td>
-    <td align="center"><sub>GPU + server</sub></td></tr>
-<tr><td><a href="kernelbench"><code>kernelbench</code></a></td>
-    <td align="center">2</td><td align="center">Triton</td>
+<tr><td rowspan="1"><b>⚡ GPU kernel optimization</b></td>
+    <td><a href="gpukernel"><code>gpukernel</code></a></td>
+    <td align="center">1</td><td align="center">CUDA / Triton</td>
     <td align="center"><sub>GPU + server</sub></td></tr>
 
 <tr><td rowspan="2"><b>🧮 Algorithm engineering</b></td>

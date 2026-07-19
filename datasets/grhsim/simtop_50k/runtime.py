@@ -1076,7 +1076,11 @@ class GrhSimRuntime:
         environment["LC_ALL"] = "C"
         environment["EMU_PROGRESS_EVERY_CYCLES"] = "0"
         environment.pop("EMU_RUNTIME_PROFILE", None)
-        environment.pop("WOLVRIX_GRHSIM_PURE_EVENT_WORD_TSV", None)
+        for name in tuple(environment):
+            if name.startswith("GRHSIM_TRACE_") or (
+                name.startswith("WOLVRIX_GRHSIM_") and name.endswith("_TSV")
+            ):
+                environment.pop(name, None)
         self._environment = environment
         return environment
 
@@ -1568,23 +1572,21 @@ class GrhSimRuntime:
         original_affinity = self._pin_runner(placement.helper_cpu)
         try:
             schedule: list[tuple[str, ArtifactSet]] = []
+            schedule_order: str
             if control_artifacts is None:
+                schedule_order = "B" * self.config.samples_per_variant
                 schedule = [
                     ("candidate", candidate_artifacts)
                     for _ in range(self.config.samples_per_variant)
                 ]
             else:
                 order = self.config.group_order.upper()
-                if (
-                    len(order) != 2 * self.config.samples_per_variant
-                    or order.count("A") != self.config.samples_per_variant
-                    or order.count("B") != self.config.samples_per_variant
-                    or any(role not in "AB" for role in order)
-                ):
+                if self.config.samples_per_variant != 2 or order not in {"ABBA", "BAAB"}:
                     raise ValueError(
-                        "group_order must contain exactly samples_per_variant each of "
-                        "A(control) and B(candidate)"
+                        "formal paired measurement requires samples_per_variant=2 and "
+                        "group_order=ABBA or BAAB"
                     )
+                schedule_order = order
                 artifacts_by_role = {"A": control_artifacts, "B": candidate_artifacts}
                 names_by_role = {"A": "control", "B": "candidate"}
                 schedule = [
@@ -1630,6 +1632,7 @@ class GrhSimRuntime:
             "diagnostics": {
                 "placement": placement.as_dict(),
                 "group_fixed_ccd_cpu": True,
+                "group_order": schedule_order,
                 "headline_metric": "Host time spent walltime_ms",
                 "aggregation": "arithmetic_mean",
                 "candidate_walltime_range_ms": [min(candidate_times), max(candidate_times)],

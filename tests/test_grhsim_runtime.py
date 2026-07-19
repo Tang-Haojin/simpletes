@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -382,6 +383,41 @@ def test_runtime_config_accepts_evaluator_aliases_and_ignores_extra_keys(tmp_pat
     assert config.results_dir == tmp_path / "slot/simtop_50k_results"
 
 
+def test_runtime_environment_removes_inherited_profile_and_trace_knobs(tmp_path: Path):
+    env_sh = tmp_path / "env.sh"
+    env_sh.write_text("true\n", encoding="utf-8")
+
+    def fake_run(command, **kwargs):
+        output = b"\0".join(
+            (
+                b"PATH=/usr/bin",
+                b"EMU_RUNTIME_PROFILE=1",
+                b"GRHSIM_TRACE_EVAL=1",
+                b"GRHSIM_TRACE_EVAL_EVERY=1",
+                b"WOLVRIX_GRHSIM_SUPERNODE_TSV=/tmp/supernode.tsv",
+                b"WOLVRIX_GRHSIM_COFIRE_TSV=/tmp/cofire.tsv",
+                b"WOLVRIX_GRHSIM_PURE_EVENT_WORD_TSV=/tmp/word.tsv",
+            )
+        )
+        return subprocess.CompletedProcess(command, 0, stdout=output + b"\0", stderr=b"")
+
+    environment = GrhSimRuntime(
+        RuntimeConfig(
+            env_sh=env_sh,
+            env_overrides={"WOLVRIX_GRHSIM_SAME_BATCH_ACTIVATION_COHORT_TSV": "/tmp/cohort.tsv"},
+        ),
+        run_command=fake_run,
+    )._prepare_environment()
+
+    assert environment["EMU_PROGRESS_EVERY_CYCLES"] == "0"
+    assert "EMU_RUNTIME_PROFILE" not in environment
+    assert not any(name.startswith("GRHSIM_TRACE_") for name in environment)
+    assert not any(
+        name.startswith("WOLVRIX_GRHSIM_") and name.endswith("_TSV")
+        for name in environment
+    )
+
+
 def test_external_load_is_returned_as_retryable_infrastructure():
     class LoadedRuntime(GrhSimRuntime):
         def _evaluate_impl(self, candidate, control):
@@ -424,6 +460,7 @@ def test_formal_default_schedule_is_abba_and_placement_is_fixed(tmp_path: Path):
     assert result["valid"]
     assert [role for role, _ in seen] == ["control", "candidate", "candidate", "control"]
     assert all(selected is placement for _, selected in seen)
+    assert result["diagnostics"]["group_order"] == "ABBA"
     assert result["control_walltime_ms"] == 100
     assert result["candidate_walltime_ms"] == 90
     assert result["relative_improvement"] == pytest.approx(0.1)
@@ -456,3 +493,29 @@ def test_formal_promotion_can_use_reversed_baab_order(tmp_path: Path):
 
     assert result["valid"]
     assert seen == ["candidate", "control", "control", "candidate"]
+    assert result["diagnostics"]["group_order"] == "BAAB"
+
+
+@pytest.mark.parametrize("group_order", ["AABB", "BABA", "ABAB"])
+def test_formal_schedule_rejects_non_bracketed_orders(tmp_path: Path, group_order: str):
+    candidate = _write_artifacts(tmp_path / "candidate", "candidate")
+    control = _write_artifacts(tmp_path / "control", "control")
+
+    class FakeRuntime(GrhSimRuntime):
+        def _prepare_environment(self):
+            return {}
+
+        def _require_tools(self, environment):
+            return None
+
+        def _select_fixed_placement(self, environment):
+            self._placement = _placement()
+            return self._placement
+
+    result = FakeRuntime(
+        RuntimeConfig(samples_per_variant=2, group_order=group_order)
+    ).evaluate(candidate, control=control)
+
+    assert not result["valid"]
+    assert result["infrastructure_retry"]
+    assert "group_order=ABBA or BAAB" in result["diagnostics"]["error"]

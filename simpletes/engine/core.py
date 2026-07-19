@@ -14,11 +14,14 @@ from __future__ import annotations
 _QUEUE_SIZE_MULTIPLIER = 8
 _MIN_QUEUE_SIZE = 4096
 _INITIAL_SHARED_CONSTRUCTION_ENV = "SIMPLETES_INITIAL_SHARED_CONSTRUCTION_PATH"
+_RETRYABLE_EVAL_DEFAULT_DELAY_SEC = 30.0
+_RETRYABLE_EVAL_MAX_DELAY_SEC = 300.0
 
 from datetime import datetime
 import asyncio
 from functools import lru_cache
 import importlib.util
+import math
 import os
 import signal
 import sys
@@ -55,6 +58,34 @@ from simpletes.policies import Selector, create_selector
 from simpletes.construction import summarize_construction_payload, write_payload
 from simpletes.utils.task_prep import load_task_requirements
 from simpletes.utils.text import DEFAULT_METRICS_ERROR_MAX_CHARS, truncate_error_in_metrics
+
+
+def _counts_toward_valid_budget(node: Node) -> bool:
+    """Return whether *node* is a decision-quality generated candidate."""
+    return (
+        node.gen_id is not None
+        and isinstance(node.metrics, dict)
+        and node.metrics.get("valid_candidate") in (True, 1)
+    )
+
+
+def _retryable_evaluation_delay(metrics: Any) -> float | None:
+    """Return a bounded retry delay for a trusted infrastructure outcome."""
+    if not isinstance(metrics, dict):
+        return None
+    retryable = any(
+        metrics.get(key) in (True, 1, 1.0)
+        for key in ("retryable", "infrastructure_retry", "retryable_infra")
+    )
+    if not retryable:
+        return None
+    try:
+        delay = float(metrics.get("retry_after_s", _RETRYABLE_EVAL_DEFAULT_DELAY_SEC))
+    except (TypeError, ValueError):
+        delay = _RETRYABLE_EVAL_DEFAULT_DELAY_SEC
+    if not math.isfinite(delay):
+        delay = _RETRYABLE_EVAL_DEFAULT_DELAY_SEC
+    return min(max(delay, 1.0), _RETRYABLE_EVAL_MAX_DELAY_SEC)
 
 
 # ============================================================================
@@ -142,6 +173,10 @@ class SimpleTESEngine(SchedulerMixin):
 
         # Runtime state
         self.completed_evaluations: int = 0
+        # Candidate evaluators may distinguish a completed, decision-quality
+        # evaluation from an infrastructure retry by returning
+        # ``valid_candidate=1``.  The initial program is never counted.
+        self.valid_evaluations: int = 0
         self.generation_attempts: int = 0
         self.generation_failures: int = 0
         self.generation_cancellations: int = 0
@@ -302,6 +337,8 @@ class SimpleTESEngine(SchedulerMixin):
             f"[dim]Init eval:[/dim] repeats={c.init_eval_repeats} | reduce=max",
             f"[dim]Timeouts:[/dim] eval={c.eval_timeout:g}s | backpressure={c.backpressure_multiplier:g}",
             f"[dim]Budget:[/dim] max_generations={c.max_generations}" +
+            (f" | max_valid_evaluations={c.max_valid_evaluations}"
+             if c.max_valid_evaluations is not None else "") +
             (f" | early_stop={c.early_stop_score:.6f}" if c.early_stop_score is not None else ""),
             "",
             "[bold]── Checkpoint ──[/bold]",
@@ -437,21 +474,33 @@ class SimpleTESEngine(SchedulerMixin):
             shared_path = os.path.join(self._shared_construction_dir, f"{shared_construction_id}.json")
         if shared_path is not None and not os.path.exists(shared_path):
             shared_path = None
-        try:
-            outcome = await self.worker.evaluate(
-                code,
-                shared_construction_path=shared_path,
-            )
-            metrics = outcome.metrics
-            truncate_error_in_metrics(metrics, max_chars=DEFAULT_METRICS_ERROR_MAX_CHARS)
-            return EvaluationOutcome(
-                metrics=metrics,
-                captured_construction_payload=outcome.captured_construction_payload,
-            )
-        except Exception as e:
-            metrics = {"error": str(e), "combined_score": -float("inf")}
-            truncate_error_in_metrics(metrics, max_chars=DEFAULT_METRICS_ERROR_MAX_CHARS)
-            return EvaluationOutcome(metrics=metrics, captured_construction_payload=None)
+        while True:
+            try:
+                outcome = await self.worker.evaluate(
+                    code,
+                    shared_construction_path=shared_path,
+                )
+                metrics = outcome.metrics
+                truncate_error_in_metrics(metrics, max_chars=DEFAULT_METRICS_ERROR_MAX_CHARS)
+            except Exception as e:
+                metrics = {"error": str(e), "combined_score": -float("inf")}
+                truncate_error_in_metrics(metrics, max_chars=DEFAULT_METRICS_ERROR_MAX_CHARS)
+                return EvaluationOutcome(metrics=metrics, captured_construction_payload=None)
+
+            retry_delay = _retryable_evaluation_delay(metrics)
+            if retry_delay is None:
+                return EvaluationOutcome(
+                    metrics=metrics,
+                    captured_construction_payload=outcome.captured_construction_payload,
+                )
+            rich_print(self._log(
+                "⟳",
+                f"[yellow]Retryable evaluation infrastructure outcome; "
+                f"retrying the same candidate in {retry_delay:g}s[/yellow]",
+            ))
+            if self._stop_event.is_set():
+                raise asyncio.CancelledError()
+            await asyncio.sleep(retry_delay)
 
     async def _handle_invalid_evaluation(
         self,
@@ -566,6 +615,7 @@ class SimpleTESEngine(SchedulerMixin):
         best_code, metadata, config, policy, nodes, failure_records, shared_snapshot = await self._snapshot_for_checkpoint()
         # Save gen_id counter for resume
         metadata["gen_id_counter"] = self.generator.get_gen_id_counter()
+        metadata["valid_evaluations"] = self.valid_evaluations
         # Save per-chain best scores
         metadata["chain_best_scores"] = {
             str(k): v for k, v in self._chain_best_scores.items()
@@ -588,6 +638,9 @@ class SimpleTESEngine(SchedulerMixin):
             f"[dim]Gen fails:[/dim] {self.generation_failures}\n"
             f"[dim]Gen cancels:[/dim] {self.generation_cancellations}\n"
             f"[dim]Eval rejects:[/dim] {self.evaluation_failures}\n"
+            f"[dim]Valid candidates:[/dim] {self.valid_evaluations}"
+            + (f"/{self.config.max_valid_evaluations}\n"
+               if self.config.max_valid_evaluations is not None else "\n") +
             f"[bold]Best score:[/bold] [green]{self.best_score:.8f}[/green]",
             border_style="green",
             title="[bold]Final Results[/bold]",
@@ -729,6 +782,7 @@ class SimpleTESEngine(SchedulerMixin):
         improved = False
         old_best_score = -float("inf")
         early_stop_just_triggered = False
+        valid_limit_just_triggered = False
 
         async with self._db_lock:
             self.db.add(node)
@@ -759,6 +813,13 @@ class SimpleTESEngine(SchedulerMixin):
             self.completed_evaluations += 1
             ce = self.completed_evaluations
 
+            if _counts_toward_valid_budget(node):
+                self.valid_evaluations += 1
+                limit = self.config.max_valid_evaluations
+                valid_limit_just_triggered = (
+                    limit is not None and self.valid_evaluations >= limit
+                )
+
             should_ckpt = self.config.log_interval > 0 and ce % self.config.log_interval == 0
 
             # Threshold-based db_show_interval to avoid skips under high concurrency.
@@ -779,6 +840,12 @@ class SimpleTESEngine(SchedulerMixin):
             rich_print(self._log("🏆", f"[green]New best score: {node.score:.6f} at chain {node.chain_idx} (prev: {old_best_score:.6f}, node: {node.id[:8]} at chain {node.chain_idx})[/green]"))
         if early_stop_just_triggered:
             rich_print(self._log("✓", f"[bold green]Early stop triggered! score={self.best_score:.6f} >= threshold={self.config.early_stop_score:.6f}[/bold green]"))
+        if valid_limit_just_triggered:
+            rich_print(self._log(
+                "✓",
+                f"[bold green]Valid-candidate limit reached: "
+                f"{self.valid_evaluations}/{self.config.max_valid_evaluations}[/bold green]",
+            ))
 
         # Notify policy outside lock
         completion = self.selector.on_child_done(node, parents)
@@ -920,6 +987,7 @@ class SimpleTESEngine(SchedulerMixin):
             self.generator.set_gen_id_counter(restored["gen_id_counter"])
         self.instance_id = restored["instance_id"]
         self.completed_evaluations = restored["completed_evaluations"]
+        self.valid_evaluations = restored.get("valid_evaluations", 0)
         self.generation_attempts = restored["generation_attempts"]
         self.generation_failures = restored.get("generation_failures", 0)
         self.generation_cancellations = restored.get("generation_cancellations", 0)

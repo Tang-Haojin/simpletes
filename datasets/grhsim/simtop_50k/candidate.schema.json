@@ -1,0 +1,137 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "GrhSIM SimTop 50k optimization candidate",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "hypothesis",
+    "evidence",
+    "patch",
+    "enable_options"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "integer",
+      "const": 1
+    },
+    "hypothesis": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 4000
+    },
+    "evidence": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 32,
+      "items": {
+        "type": "string",
+        "minLength": 1,
+        "maxLength": 4000
+      }
+    },
+    "patch": {
+      "type": "string",
+      "maxLength": 1048576
+    },
+    "enable_options": {
+      "type": "array",
+      "maxItems": 64,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["name", "value"],
+        "properties": {
+          "name": {
+            "type": "string",
+            "enum": [
+              "active_mask_gap_pack_policy",
+              "commit_guard_event_buckets",
+              "declared_value_compute_node_boundary",
+              "deferred_activation_forward_policy",
+              "direct_single_writer_state_reads",
+              "dp_segment_penalty_ppm",
+              "emit_parallelism",
+              "enable_local_shared_compute",
+              "enable_mem_to_reg",
+              "final_fanin_pullback_max_moved_op_ppm",
+              "final_fanin_pullback_max_moves",
+              "final_fanin_pullback_max_node_ops",
+              "final_fanin_pullback_max_value_width",
+              "final_fanin_pullback_min_gain",
+              "final_fanin_pullback_policy",
+              "final_shared_input_peer_max_candidates",
+              "final_shared_input_peer_max_inputs",
+              "final_shared_input_peer_max_moved_op_ppm",
+              "final_shared_input_peer_max_moves",
+              "final_shared_input_peer_max_node_ops",
+              "final_shared_input_peer_max_outputs",
+              "final_shared_input_peer_max_peers",
+              "final_shared_input_peer_max_value_width",
+              "final_shared_input_peer_policy",
+              "final_sibling_fusion_max_fused_op_ppm",
+              "final_sibling_fusion_max_pairs",
+              "final_sibling_fusion_min_gain",
+              "final_sibling_fusion_policy",
+              "final_terminal_pushforward_max_inputs",
+              "final_terminal_pushforward_max_moved_op_ppm",
+              "final_terminal_pushforward_max_moves",
+              "final_terminal_pushforward_max_node_ops",
+              "final_terminal_pushforward_max_outputs",
+              "final_terminal_pushforward_max_value_width",
+              "final_terminal_pushforward_min_bae_gain",
+              "final_terminal_pushforward_min_boundary_value_gain",
+              "final_terminal_pushforward_policy",
+              "final_topo_policy",
+              "full_active_word_consume",
+              "kahn_level_pack_max_moved_op_ppm",
+              "kahn_level_pack_max_moves",
+              "kahn_level_pack_max_regression_ppm",
+              "kahn_level_pack_policy",
+              "local_shared_compute_common_owner_max_cloned_op_ppm",
+              "local_shared_compute_common_owner_max_clones",
+              "local_shared_compute_common_owner_policy",
+              "local_shared_compute_max_cloned_op_ppm",
+              "local_shared_compute_max_clones",
+              "local_shared_compute_max_fanout",
+              "local_shared_compute_max_width",
+              "max_op_in_commit_supernode",
+              "max_op_in_compute_node",
+              "max_op_in_compute_supernode",
+              "mem_to_reg_row_limit",
+              "post_dp_refine_max_moved_op_ppm",
+              "post_dp_refine_max_moves",
+              "post_dp_refine_max_regression_ppm",
+              "post_dp_refine_max_rounds",
+              "post_dp_refine_policy",
+              "pure_event_compute_word_bypass",
+              "pure_event_word_pack_max_changed_word_ppm",
+              "pure_event_word_pack_max_moved_supernode_ppm",
+              "pure_event_word_pack_policy",
+              "reg_to_mem_decoded_write_storage",
+              "reg_to_mem_intent",
+              "reg_to_mem_ordered_writes",
+              "same_batch_activation_cohort_policy",
+              "sched_batches_per_cpp",
+              "sched_batch_max_estimated_lines",
+              "sched_batch_max_ops",
+              "sched_batch_target_count",
+              "simplify_keep_declared_symbols",
+              "skip_comb_lane_pack",
+              "split_oversize_compute_nodes",
+              "split_oversize_compute_node_max_ops"
+            ]
+          },
+          "value": {
+            "anyOf": [
+              {"type": "boolean"},
+              {"type": "integer"},
+              {"type": "number"},
+              {"type": "string"}
+            ]
+          }
+        }
+      }
+    }
+  }
+}

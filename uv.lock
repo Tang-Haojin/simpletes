@@ -2394,6 +2394,7 @@ version = "1.0.0"
 source = { virtual = "." }
 dependencies = [
     { name = "cython" },
+    { name = "jsonschema" },
     { name = "litellm" },
     { name = "matplotlib" },
     { name = "numpy" },
@@ -2411,6 +2412,7 @@ dependencies = [
 [package.metadata]
 requires-dist = [
     { name = "cython", specifier = ">=3.0.0" },
+    { name = "jsonschema", specifier = ">=4.0.0" },
     { name = "litellm", specifier = ">=1.80.0" },
     { name = "matplotlib", specifier = ">=3.10.8" },
     { name = "numpy", specifier = ">=2.2.6" },

@@ -240,6 +240,7 @@ class CheckpointManager:
             "eval_venv": getattr(c, "eval_venv", None),
             "eval_python": c.eval_python,
             "instruction_path": c.instruction_path, "max_generations": c.max_generations,
+            "max_valid_evaluations": c.max_valid_evaluations,
             "num_inspirations": c.num_inspirations,
             "min_inspirations_cnt": c.min_inspirations_cnt,
             "max_inspirations_cnt": c.max_inspirations_cnt,
@@ -403,6 +404,7 @@ class CheckpointManager:
         return {
             "instance_id": metadata.get("instance_id", self.instance_id),
             "completed_evaluations": int(metadata.get("completed_evaluations", 0)),
+            "valid_evaluations": int(metadata.get("valid_evaluations", 0)),
             "generation_attempts": int(metadata.get("generation_attempts", 0)),
             "generation_failures": int(metadata.get("generation_failures", 0)),
             "generation_cancellations": int(metadata.get("generation_cancellations", 0)),

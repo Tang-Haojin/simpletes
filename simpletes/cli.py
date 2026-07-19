@@ -38,6 +38,12 @@ def build_parser(*, mode: str = "single") -> argparse.ArgumentParser:
         help=f"Number of generation prompts to schedule (default: {EngineConfig.max_generations})",
     )
     parser.add_argument(
+        "--max-valid-evaluations",
+        type=int,
+        default=EngineConfig.max_valid_evaluations,
+        help="Stop after this many valid candidate evaluations (default: disabled)",
+    )
+    parser.add_argument(
         "--early-stop-score",
         type=float,
         default=None,
@@ -263,9 +269,9 @@ def build_parser(*, mode: str = "single") -> argparse.ArgumentParser:
     parser.add_argument(
         "--llm-backend",
         type=str,
-        choices=["litellm", "vllm_token_forcing"],
+        choices=["litellm", "vllm_token_forcing", "codex_exec"],
         default=None,
-        help="LLM backend to use (litellm, vllm_token_forcing). Defaults to litellm.",
+        help="LLM backend to use (litellm, vllm_token_forcing, codex_exec). Defaults to litellm.",
     )
     parser.add_argument(
         "--model",
@@ -329,7 +335,7 @@ def build_parser(*, mode: str = "single") -> argparse.ArgumentParser:
     parser.add_argument(
         "--reasoning-effort",
         type=str,
-        choices=["low", "medium", "high"],
+        choices=["low", "medium", "high", "ultra"],
         default=EngineConfig.reasoning_effort,
         help=f"Reasoning effort level for supported models (default: {EngineConfig.reasoning_effort})",
     )
@@ -350,6 +356,32 @@ def build_parser(*, mode: str = "single") -> argparse.ArgumentParser:
         type=int,
         default=EngineConfig.context_window,
         help=f"(vllm_token_forcing) vLLM server context window size (default: {EngineConfig.context_window})",
+    )
+    parser.add_argument(
+        "--codex-config",
+        dest="codex_config_path",
+        type=str,
+        default=EngineConfig.codex_config_path,
+        help="(codex_exec) Source config TOML copied into an isolated CODEX_HOME",
+    )
+    parser.add_argument(
+        "--codex-auth",
+        dest="codex_auth_path",
+        type=str,
+        default=EngineConfig.codex_auth_path,
+        help="(codex_exec) Source auth JSON copied into an isolated CODEX_HOME",
+    )
+    parser.add_argument(
+        "--codex-repo-root",
+        type=str,
+        default=EngineConfig.codex_repo_root,
+        help="(codex_exec) Repository root exposed read-only to Codex",
+    )
+    parser.add_argument(
+        "--codex-output-schema",
+        type=str,
+        default=EngineConfig.codex_output_schema,
+        help="(codex_exec) JSON Schema constraining the final response",
     )
     # Resume
     parser.add_argument("--resume", type=str, help="Checkpoint path to resume from")

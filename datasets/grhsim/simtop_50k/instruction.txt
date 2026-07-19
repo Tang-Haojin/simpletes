@@ -1,0 +1,57 @@
+You are optimizing GrhSIM's end-to-end XiangShan SimTop simulation performance.
+
+Research the repository deeply before proposing one candidate. Read the current
+implementation, generated GrhSIM and GSIM C++, prior experiments in
+`pdocs/grhsim_opt` and `pdocs/grhsim_opt_thj`, and available perf/emu artifacts.
+Use concrete evidence; do not repeat a direction that the records already close
+unless you identify materially new evidence or a different mechanism.
+
+The only optimization objective and final score is SimTop 50k `Host time spent`
+walltime. Cycles, instructions, generated-source size, ELF sections, BAE, DAG
+edges, PMU counters, and profiles are diagnostic evidence only. A change is
+useful only if the fixed-ASLR, functionally equivalent end-to-end run improves.
+
+Return exactly one JSON object matching `candidate.schema.json`. The backend
+will place it between the EVOLVE-BLOCK markers. Its fields mean:
+
+- `schema_version`: always `1`.
+- `hypothesis`: the precise mechanism and expected end-to-end effect.
+- `evidence`: repository paths plus absolute observed counts/timings/profile
+  facts that motivated this candidate. Never invent measurements.
+- `patch`: a complete `git diff`-style unified diff relative to
+  `wolvrix@f17e90e`. It must end with a newline.
+- `enable_options`: a non-empty array of `{ "name": snake_case, "value": ... }`
+  entries that explicitly enable the candidate during generation. Names map to
+  `WOLVRIX_XS_GRHSIM_<UPPER_CASE_NAME>` and must be members of the explicit
+  optimization allowlist in `candidate.schema.json`. Reuse an existing
+  default-off experimental policy when refining its implementation. Diagnostic
+  `probe`/profile/report/stats/trace/dump/export values are forbidden.
+
+Hard constraints:
+
+1. Modify only existing, tracked, regular C/C++ source/header files under
+   `wolvrix/lib/`, `wolvrix/include/`, or `wolvrix/app/pybind/`, with suffix
+   `.c`, `.cc`, `.cpp`, `.cxx`, `.h`, `.hh`, `.hpp`, `.hxx`, or `.inc`. Do not
+   add, delete, or rename files. Diff paths omit the leading `wolvrix/` because
+   the patch is applied inside that submodule.
+2. Never modify the benchmark, runner, workload, timing output, GSIM reference,
+   generated files, parent-repository scripts, documentation, submodule
+   pointers, external dependencies, or default/current production behavior.
+3. The optimization must be default-off: without `enable_options`, generated
+   source must remain byte-identical to the pinned current-default control.
+   With `enable_options`, your patched output must also differ from an
+   unpatched build using the same options; an existing knob's old behavior is
+   not attributable evidence for a no-op patch.
+4. Do not use absolute paths, path traversal, symlinks, executable/binary diffs,
+   rename/copy directives, shell fragments, or credentials. Do not read, quote,
+   expose, or place any API key/authentication material in the response.
+   Resume-from, stats, profile, stop, export, instrumentation, and measurement
+   controls are evaluator-owned and cannot be selected through `enable_options`.
+5. Preserve simulator semantics. The evaluator performs focused tests,
+   fixed-ASLR 100/10k gates, and a strict 50k functional/performance protocol.
+   It rejects invalid infrastructure samples rather than treating them as a
+   performance result.
+6. Prefer a small, attributable candidate. Do not bundle unrelated ideas.
+
+The initial program is the special no-op control. Every generated candidate
+must contain both a non-empty patch and at least one `enable_options` entry.

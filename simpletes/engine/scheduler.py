@@ -178,6 +178,10 @@ class SchedulerMixin:
         if self._stop_event.is_set():
             return False
 
+        valid_limit = self.config.max_valid_evaluations
+        if valid_limit is not None and self.valid_evaluations >= valid_limit:
+            return False
+
         k = self.config.k_candidates
         assert k > 0, "k_candidates must be > 0"
 
@@ -233,6 +237,13 @@ class SchedulerMixin:
         Uses atomic snapshot of all relevant state to avoid TOCTOU race conditions.
         Double-checks after a brief yield to ensure no in-flight work.
         """
+        valid_limit = self.config.max_valid_evaluations
+        if valid_limit is not None and self.valid_evaluations >= valid_limit:
+            # The evaluation that reached the limit has already committed and
+            # notified the policy before waking the scheduler.  Returning here
+            # lets LocalRuntime cancel queued/in-flight surplus candidates.
+            return True
+
         # First check: atomic snapshot of all state
         async with self._counter_lock:
             gen_attempts = self.generation_attempts
@@ -270,7 +281,12 @@ class SchedulerMixin:
                 continue
 
             if await self._is_run_complete():
-                rich_print(self._log("✓", "[bold green]Max generations reached. Stopping.[/bold green]"))
+                valid_limit = self.config.max_valid_evaluations
+                if valid_limit is not None and self.valid_evaluations >= valid_limit:
+                    reason = "Valid-candidate limit reached. Stopping."
+                else:
+                    reason = "Max generations reached. Stopping."
+                rich_print(self._log("✓", f"[bold green]{reason}[/bold green]"))
                 self._stop_event.set()
                 break
 

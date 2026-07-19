@@ -117,6 +117,7 @@ class EngineConfig:
     
     # Budget / termination
     max_generations: int = 100
+    max_valid_evaluations: int | None = None
     early_stop_score: float | None = None
     
     # Prompt shape
@@ -142,8 +143,14 @@ class EngineConfig:
     retry: int = 0
     timeout: float | None = 3000
     max_total_tokens: int | None = None  # Total token budget (prompt + completion). If set, caps completion tokens.
-    reasoning_effort: str = "medium"  # Reasoning effort level for supported models (low, medium, high)
-    llm_backend: str = "litellm"  # litellm | vllm_token_forcing
+    reasoning_effort: str = "medium"  # Reasoning effort level for supported models (low, medium, high, ultra)
+    llm_backend: str = "litellm"  # litellm | vllm_token_forcing | codex_exec
+
+    # Codex CLI (codex_exec backend). These are file locations, never secrets.
+    codex_config_path: str | None = None
+    codex_auth_path: str | None = None
+    codex_repo_root: str | None = None
+    codex_output_schema: str | None = None
 
     # Token forcing (vllm_token_forcing backend)
     reasoning_budget: int | None = 32768  # Phase 1 total budget (prompt + reasoning). None = auto from context_window - response_budget
@@ -205,6 +212,7 @@ def build_config_from_args(args: Any) -> EngineConfig:
         eval_venv=args.eval_venv,
         eval_python=resolve_eval_python(evaluator_path=args.evaluator, eval_venv=args.eval_venv),
         max_generations=args.max_generations,
+        max_valid_evaluations=args.max_valid_evaluations,
         early_stop_score=args.early_stop_score,
         num_inspirations=args.num_inspirations,
         min_inspirations_cnt=args.min_inspirations_cnt,
@@ -227,6 +235,10 @@ def build_config_from_args(args: Any) -> EngineConfig:
         response_budget=args.response_budget,
         context_window=args.context_window,
         llm_backend=resolve_llm_backend(args),
+        codex_config_path=args.codex_config_path,
+        codex_auth_path=args.codex_auth_path,
+        codex_repo_root=args.codex_repo_root,
+        codex_output_schema=args.codex_output_schema,
         reflection_mode=not args.disable_reflection,
         output_path=args.output_path,
         log_interval=args.log_interval,
@@ -335,6 +347,11 @@ def examine_args(args, *, mode: str = "single", policies: set[str]) -> None:
     # Budget / timeouts
     _maybe_warn_nonpositive("--max-generations", getattr(args, "max_generations", None),
                             "must be > 0; no generations will be scheduled")
+    _maybe_warn_nonpositive(
+        "--max-valid-evaluations",
+        getattr(args, "max_valid_evaluations", None),
+        "must be > 0 when specified",
+    )
     _maybe_warn_nonpositive("--eval-timeout", getattr(args, "eval_timeout", None),
                             "must be > 0; evaluations will immediately timeout")
     timeout = getattr(args, "timeout", None)
@@ -349,6 +366,12 @@ def examine_args(args, *, mode: str = "single", policies: set[str]) -> None:
     retry = getattr(args, "retry", None)
     if isinstance(retry, int) and retry < 0:
         _warn(f"--retry is negative (got {retry}); it will be clamped to 0")
+
+    if getattr(args, "llm_backend", None) == "codex_exec":
+        _maybe_warn_path("--codex-config", getattr(args, "codex_config_path", None))
+        _maybe_warn_path("--codex-auth", getattr(args, "codex_auth_path", None))
+        _maybe_warn_path("--codex-repo-root", getattr(args, "codex_repo_root", None))
+        _maybe_warn_path("--codex-output-schema", getattr(args, "codex_output_schema", None))
 
     # Prompt shaping
     num_insp = getattr(args, "num_inspirations", None)
@@ -416,4 +439,3 @@ def examine_args(args, *, mode: str = "single", policies: set[str]) -> None:
     db_show_interval = getattr(args, "db_show_interval", None)
     if isinstance(db_show_interval, int) and db_show_interval <= 0:
         _warn("--db-show-interval <= 0 disables DB state printing")
-

@@ -93,43 +93,57 @@ def main():
 
 
 def _run_preflight(config) -> None:
-    """Validate LLM credentials with a 1-token ping before starting the engine.
+    """Validate LLM credentials before starting the engine.
 
-    Only runs for the litellm backend — the vllm_token_forcing client has
-    different bring-up semantics and doesn't suffer the same opaque
-    BrokenProcessPool failure mode.
+    LiteLLM uses a one-token ping.  ``codex_exec`` performs one ephemeral,
+    schema-constrained request so model/config mismatches and authentication
+    failures are discovered before an expensive experiment starts.
     """
-    if config.llm_backend != "litellm":
+    if config.llm_backend == "vllm_token_forcing":
         return
 
     from rich import print as rich_print
 
-    from simpletes.llm import LLMCallError, LLMClient
+    from simpletes.llm import LLMCallError, LLMClient, create_llm_client
 
-    client = LLMClient(
-        model=config.model,
-        temperature=config.temperature,
-        max_tokens=config.max_tokens,
-        api_key=config.api_key,
-        api_base=config.api_base,
-        timeout=config.timeout,
-        retry=0,
-        pool_size=0,  # preflight runs synchronously in the main process
-        reasoning_effort=config.reasoning_effort,
-    )
+    client = None
     try:
-        client.preflight()
-    except LLMCallError as err:
+        if config.llm_backend == "codex_exec":
+            client = create_llm_client(config)
+            asyncio.run(client.preflight())
+        else:
+            client = LLMClient(
+                model=config.model,
+                temperature=config.temperature,
+                max_tokens=config.max_tokens,
+                api_key=config.api_key,
+                api_base=config.api_base,
+                timeout=config.timeout,
+                retry=0,
+                pool_size=0,  # preflight runs synchronously in the main process
+                reasoning_effort=config.reasoning_effort,
+            )
+            client.preflight()
+    except (LLMCallError, ValueError) as err:
         rich_print("[bold red]✗ LLM preflight failed[/bold red]")
-        rich_print(f"  [dim]Model:    [/dim]{err.model}")
-        rich_print(f"  [dim]API base: [/dim]{err.api_base or '(provider default)'}")
-        rich_print(f"  [dim]Error:    [/dim][red]{err.error_type}[/red]")
-        rich_print(f"  [dim]Message:  [/dim]{err.message}")
+        rich_print(f"  [dim]Model:    [/dim]{getattr(err, 'model', config.model)}")
+        rich_print(
+            f"  [dim]API base: [/dim]"
+            f"{getattr(err, 'api_base', None) or '(provider/config default)'}"
+        )
+        rich_print(
+            f"  [dim]Error:    [/dim][red]"
+            f"{getattr(err, 'error_type', type(err).__name__)}[/red]"
+        )
+        rich_print(f"  [dim]Message:  [/dim]{getattr(err, 'message', str(err))}")
         rich_print(
             "\n[dim]Fix the credentials or pass --skip-preflight to bypass this check "
             "(e.g. if your local backend is still starting up).[/dim]"
         )
         sys.exit(2)
+    finally:
+        if client is not None:
+            client.close()
 
 
 if __name__ == "__main__":

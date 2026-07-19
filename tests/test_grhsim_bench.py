@@ -90,6 +90,19 @@ def test_candidate_parser_normalizes_structured_output_option_entries():
     assert candidate.enable_options == {"final_terminal_pushforward_policy": "strict"}
 
 
+def test_sourced_command_output_excludes_env_setup_stderr(tmp_path: Path):
+    env_sh = tmp_path / "env.sh"
+    env_sh.write_text('printf "setup warning\\n" >&2\n', encoding="utf-8")
+
+    completed = evaluator._run_sourced(
+        env_sh,
+        ["printf", "machine-readable"],
+        cwd=tmp_path,
+    )
+
+    assert completed.stdout == "machine-readable"
+
+
 @pytest.mark.parametrize(
     "text, message",
     [
@@ -391,8 +404,10 @@ def test_recursive_clone_enumerates_nested_gitlinks(monkeypatch, tmp_path: Path)
         calls.append(args)
         if args[:3] == ["git", "clone", "--shared"]:
             Path(args[-1]).mkdir(parents=True, exist_ok=True)
-        if args[-2:] == ["rev-parse", "--is-inside-work-tree"]:
-            return subprocess.CompletedProcess(args, 0, "true\n", None)
+        if args[-2:] == ["rev-parse", "--show-toplevel"]:
+            return subprocess.CompletedProcess(
+                args, 0, str(Path(args[2]).resolve()) + "\n", None
+            )
         return subprocess.CompletedProcess(args, 0, "", None)
 
     def fake_git_output(_env_sh, repo, args):
@@ -419,6 +434,23 @@ def test_recursive_clone_enumerates_nested_gitlinks(monkeypatch, tmp_path: Path)
         == [str(source / "testcase" / "xiangshan"), str(destination / "testcase" / "xiangshan")]
         for call in calls
     )
+
+
+def test_uninitialized_submodule_directory_is_not_parent_worktree(monkeypatch, tmp_path: Path):
+    parent = tmp_path / "parent"
+    child = parent / "uninitialized-submodule"
+    child.mkdir(parents=True)
+    env_sh = tmp_path / "env.sh"
+    env_sh.write_text("true\n", encoding="utf-8")
+    monkeypatch.setattr(
+        evaluator,
+        "_run_sourced",
+        lambda *_args, **_kwargs: subprocess.CompletedProcess(
+            [], 0, str(parent.resolve()) + "\n", None
+        ),
+    )
+
+    assert not evaluator._is_initialized_git_worktree(child, env_sh)
 
 
 def test_score_reports_absolute_and_relative_walltime_and_valid_budget_flag():

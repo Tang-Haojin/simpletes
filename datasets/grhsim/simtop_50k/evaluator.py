@@ -610,7 +610,10 @@ def _run_sourced(
     """Run an argv without interpolation after sourcing the repository env.sh."""
     if not env_sh.is_file():
         raise InfrastructureError(f"required env.sh is missing: {env_sh}")
-    script = 'set -euo pipefail\nsource "$1" >/dev/null\nshift\nexec "$@"'
+    # env.sh intentionally runs pip even when sourced; suppress its setup
+    # chatter on both streams so machine-readable command output (notably
+    # git rev-parse) cannot be contaminated by pip cache warnings.
+    script = 'set -euo pipefail\nsource "$1" >/dev/null 2>&1\nshift\nexec "$@"'
     command = ["bash", "-c", script, "grhsim-evaluator", str(env_sh), *map(str, argv)]
     started = time.monotonic()
     try:
@@ -744,11 +747,19 @@ def _is_initialized_git_worktree(path: Path, env_sh: Path) -> bool:
         return False
     completed = _run_sourced(
         env_sh,
-        ["git", "-C", path, "rev-parse", "--is-inside-work-tree"],
+        ["git", "-C", path, "rev-parse", "--show-toplevel"],
         cwd=path,
         check=False,
     )
-    return completed.returncode == 0 and (completed.stdout or "").strip() == "true"
+    if completed.returncode != 0:
+        return False
+    top = (completed.stdout or "").strip()
+    if not top:
+        return False
+    try:
+        return Path(top).resolve() == path.resolve()
+    except (OSError, RuntimeError):
+        return False
 
 
 def _clone_repo_recursive(

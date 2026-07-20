@@ -292,6 +292,7 @@ def test_build_variant_appends_evaluator_fixed_assignments_after_candidate(monke
 def test_prepare_artifacts_rejects_patch_with_only_preexisting_option_effect(
     monkeypatch, tmp_path: Path
 ):
+    events: list[str] = []
     candidate = evaluator.parse_candidate_text(_candidate_text())
     control_repo = tmp_path / "control"
     candidate_repo = tmp_path / "candidate"
@@ -314,13 +315,35 @@ def test_prepare_artifacts_rejects_patch_with_only_preexisting_option_effect(
     slot = evaluator.Slot(tmp_path, control_repo, candidate_repo, results, None)
 
     monkeypatch.setattr(evaluator, "_control_artifacts", lambda _slot: control)
+
+    def fake_prepare_clone(*_args, **_kwargs):
+        events.append("clone")
+        return env_sh
+
+    def fake_stage(*_args, **_kwargs):
+        events.append("stage")
+        return "fixed-inputs"
+
+    def fake_emit(*_args, **_kwargs):
+        events.append("option-control")
+        return "option"
+
+    def fake_verify(_repo, expected, *, phase):
+        assert expected == "fixed-inputs"
+        events.append(phase)
+
+    monkeypatch.setattr(evaluator, "_prepare_candidate_clone", fake_prepare_clone)
+    monkeypatch.setattr(evaluator, "_stage_control_generation_inputs", fake_stage)
+    monkeypatch.setattr(evaluator, "_verify_generation_inputs_unchanged", fake_verify)
     monkeypatch.setattr(
-        evaluator, "_prepare_candidate_clone", lambda *_args, **_kwargs: env_sh
+        evaluator,
+        "_apply_candidate_patch",
+        lambda *_args: events.append("patch"),
     )
-    monkeypatch.setattr(evaluator, "_apply_candidate_patch", lambda *_args: None)
-    monkeypatch.setattr(evaluator, "_emit_only_fingerprint", lambda *_args, **_kwargs: "option")
+    monkeypatch.setattr(evaluator, "_emit_only_fingerprint", fake_emit)
 
     def fake_build(_repo, *, name, **_kwargs):
+        events.append(name.rsplit("_", 1)[-1])
         fingerprint = "default" if name.endswith("_disabled") else "option"
         return evaluator.BuildArtifacts(
             name=name,
@@ -337,6 +360,18 @@ def test_prepare_artifacts_rejects_patch_with_only_preexisting_option_effect(
 
     with pytest.raises(evaluator.CandidateError, match="no attributable executable effect"):
         evaluator._prepare_artifacts(candidate, slot)
+
+    assert events == [
+        "clone",
+        "stage",
+        "option-control",
+        "after the unpatched same-options emit",
+        "patch",
+        "disabled",
+        "after the default-off candidate build",
+        "enabled",
+        "after the enabled candidate build",
+    ]
 
 
 def test_control_cache_rebuilds_when_artifact_sha_changes(monkeypatch, tmp_path: Path):
@@ -387,6 +422,103 @@ def test_control_cache_rebuilds_when_artifact_sha_changes(monkeypatch, tmp_path:
     binary.write_bytes(b"binary-v2")
     evaluator._control_artifacts(slot)
     assert builds == 2
+
+
+def _write_generation_input_fixture(repo: Path) -> tuple[Path, Path, Path]:
+    rtl = repo / "build" / "xs" / "rtl" / "rtl"
+    generated = repo / "testcase" / "xiangshan" / "build" / "generated-src"
+    rtl.mkdir(parents=True)
+    generated.mkdir(parents=True)
+    simtop = rtl / "SimTop.sv"
+    module = rtl / "nested" / "Module.v"
+    module.parent.mkdir()
+    simtop.write_text("module SimTop; endmodule\n", encoding="utf-8")
+    module.write_text("module Module; endmodule\n", encoding="utf-8")
+    (rtl / "SimTop.fir").write_text("large excluded FIR\n", encoding="utf-8")
+    (rtl / "filelist.f").write_text("ignored metadata\n", encoding="utf-8")
+    macros = generated / "DifftestMacros.svh"
+    macros.write_text("`define DIFFTEST 1\n", encoding="utf-8")
+    (generated / "difftest_profile.json").write_text(
+        '{"profile":"fixed"}\n', encoding="utf-8"
+    )
+    return simtop, module, macros
+
+
+def test_stage_control_generation_inputs_copies_private_exact_snapshot(tmp_path: Path):
+    control = tmp_path / "control"
+    candidate = tmp_path / "candidate"
+    control.mkdir()
+    candidate.mkdir()
+    control_simtop, control_module, control_macros = _write_generation_input_fixture(
+        control
+    )
+
+    expected = evaluator._stage_control_generation_inputs(control, candidate)
+
+    assert evaluator.generation_input_fingerprint(control) == expected
+    assert evaluator.generation_input_fingerprint(candidate) == expected
+    assert not (candidate / "build" / "xs" / "rtl" / "rtl" / "SimTop.fir").exists()
+    assert not (candidate / "build" / "xs" / "rtl" / "rtl" / "filelist.f").exists()
+    for source in (control_simtop, control_module, control_macros):
+        destination = candidate / source.relative_to(control)
+        assert destination.read_bytes() == source.read_bytes()
+        assert not destination.is_symlink()
+        assert (destination.stat().st_dev, destination.stat().st_ino) != (
+            source.stat().st_dev,
+            source.stat().st_ino,
+        )
+
+    candidate_simtop = candidate / control_simtop.relative_to(control)
+    candidate_simtop.write_text("candidate mutation\n", encoding="utf-8")
+    assert control_simtop.read_text(encoding="utf-8") == "module SimTop; endmodule\n"
+
+
+def test_generation_input_manifest_excludes_fir_but_detects_hdl_drift(tmp_path: Path):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    _simtop, module, _macros = _write_generation_input_fixture(repo)
+    expected = evaluator.generation_input_fingerprint(repo)
+
+    (repo / "build" / "xs" / "rtl" / "rtl" / "SimTop.fir").write_text(
+        "different excluded FIR\n", encoding="utf-8"
+    )
+    assert evaluator.generation_input_fingerprint(repo) == expected
+
+    module.write_text("module Module; wire drift; endmodule\n", encoding="utf-8")
+    with pytest.raises(evaluator.InfrastructureError, match="fixed generation inputs drifted"):
+        evaluator._verify_generation_inputs_unchanged(
+            repo, expected, phase="after fixture mutation"
+        )
+
+
+def test_generation_input_manifest_rejects_symlinks_and_missing_required_files(
+    tmp_path: Path,
+):
+    unsafe = tmp_path / "unsafe"
+    unsafe.mkdir()
+    _simtop, _module, _macros = _write_generation_input_fixture(unsafe)
+    outside = tmp_path / "outside.svh"
+    outside.write_text("outside\n", encoding="utf-8")
+    (
+        unsafe
+        / "testcase"
+        / "xiangshan"
+        / "build"
+        / "generated-src"
+        / "linked.svh"
+    ).symlink_to(outside)
+    with pytest.raises(evaluator.InfrastructureError, match="may not be a symlink"):
+        evaluator.generation_input_fingerprint(unsafe)
+
+    incomplete = tmp_path / "incomplete"
+    rtl = incomplete / "build" / "xs" / "rtl" / "rtl"
+    generated = incomplete / "testcase" / "xiangshan" / "build" / "generated-src"
+    rtl.mkdir(parents=True)
+    generated.mkdir(parents=True)
+    (rtl / "Other.sv").write_text("module Other; endmodule\n", encoding="utf-8")
+    (generated / "other.h").write_text("#pragma once\n", encoding="utf-8")
+    with pytest.raises(evaluator.InfrastructureError, match="required generation inputs"):
+        evaluator.generation_input_fingerprint(incomplete)
 
 
 def test_recursive_clone_enumerates_nested_gitlinks(monkeypatch, tmp_path: Path):
@@ -622,6 +754,7 @@ def test_launcher_uses_fixed_model_serial_budget_and_only_secret_file_paths(
         target_repo=target,
         codex_config=config,
         codex_auth=auth,
+        init_program=launcher.DEFAULT_INIT_PROGRAM,
         output_path=tmp_path / "checkpoints",
         slot_root=tmp_path / "slots",
         resume=None,
@@ -649,3 +782,82 @@ def test_launcher_uses_fixed_model_serial_budget_and_only_secret_file_paths(
     assert environment["GRHSIM_RUN_FOCUSED_TESTS"] == "1"
     assert "do-not-leak" not in rendered
     assert "do-not-leak" not in json.dumps(environment)
+
+
+def test_launcher_uses_explicit_best_program_as_initial_seed(tmp_path: Path):
+    target = tmp_path / "target"
+    (target / ".git").mkdir(parents=True)
+    (target / "env.sh").write_text("true\n", encoding="utf-8")
+    config = tmp_path / "config.mjy.toml"
+    auth = tmp_path / "auth.mjy.json"
+    config.write_text("model_provider = 'mjy'\n", encoding="utf-8")
+    auth.write_text('{}\n', encoding="utf-8")
+    best_program = tmp_path / "previous" / "db_state_161238" / "best_program.txt"
+    best_program.parent.mkdir(parents=True)
+    best_program.write_text(_candidate_text(), encoding="utf-8")
+    args = SimpleNamespace(
+        target_repo=target,
+        codex_config=config,
+        codex_auth=auth,
+        init_program=best_program,
+        output_path=tmp_path / "checkpoints",
+        slot_root=tmp_path / "slots",
+        resume=None,
+        max_proposals=16,
+        valid_target=8,
+        eval_timeout=21_600.0,
+        llm_timeout=3_000.0,
+        max_tokens=32_768,
+    )
+
+    command, _environment = launcher.build_command(args)
+    init_index = command.index("--init-program")
+
+    assert command[init_index + 1] == str(best_program.resolve())
+    assert "--resume" not in command
+
+
+def test_launcher_rejects_symlinked_explicit_initial_seed(tmp_path: Path):
+    target = tmp_path / "target"
+    (target / ".git").mkdir(parents=True)
+    (target / "env.sh").write_text("true\n", encoding="utf-8")
+    config = tmp_path / "config.mjy.toml"
+    auth = tmp_path / "auth.mjy.json"
+    config.write_text("model_provider = 'mjy'\n", encoding="utf-8")
+    auth.write_text('{}\n', encoding="utf-8")
+    real_seed = tmp_path / "best_program.txt"
+    real_seed.write_text(_candidate_text(), encoding="utf-8")
+    linked_seed = tmp_path / "linked_best_program.txt"
+    linked_seed.symlink_to(real_seed)
+    args = SimpleNamespace(
+        target_repo=target,
+        codex_config=config,
+        codex_auth=auth,
+        init_program=linked_seed,
+        output_path=tmp_path / "checkpoints",
+        slot_root=tmp_path / "slots",
+        resume=None,
+        max_proposals=16,
+        valid_target=8,
+        eval_timeout=21_600.0,
+        llm_timeout=3_000.0,
+        max_tokens=32_768,
+    )
+
+    with pytest.raises(SystemExit, match="initial program must not be a symbolic link"):
+        launcher.build_command(args)
+
+
+def test_launcher_cli_defaults_to_dataset_initial_program(monkeypatch, capsys):
+    captured = {}
+
+    def fake_build_command(args):
+        captured["init_program"] = args.init_program
+        return ["true"], {}
+
+    monkeypatch.setattr(launcher, "build_command", fake_build_command)
+    monkeypatch.setattr(sys, "argv", ["launcher.py", "--dry-run"])
+
+    assert launcher.main() == 0
+    assert captured["init_program"] == launcher.DEFAULT_INIT_PROGRAM
+    assert capsys.readouterr().out.strip() == "true"

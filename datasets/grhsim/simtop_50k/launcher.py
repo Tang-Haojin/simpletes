@@ -17,6 +17,7 @@ SIMPLETES_ROOT = TASK_ROOT.parents[2]
 DEFAULT_TARGET_REPO = SIMPLETES_ROOT.parent / "wolvrix-playground-gsim-calibrate-5"
 DEFAULT_CODEX_CONFIG = Path("~/.codex/config.mjy.toml").expanduser()
 DEFAULT_CODEX_AUTH = Path("~/.codex/auth.mjy.json").expanduser()
+DEFAULT_INIT_PROGRAM = TASK_ROOT / "init_program.txt"
 MODEL = "gpt-5.6-sol"
 REASONING_EFFORT = "ultra"
 
@@ -39,7 +40,7 @@ def build_command(args: argparse.Namespace) -> tuple[list[str], dict[str, str]]:
     codex_config = _regular_file(args.codex_config, "Codex config")
     codex_auth = _regular_file(args.codex_auth, "Codex auth")
     schema = _regular_file(TASK_ROOT / "candidate.schema.json", "candidate schema")
-    init_program = _regular_file(TASK_ROOT / "init_program.txt", "initial program")
+    init_program = _regular_file(args.init_program, "initial program")
     evaluator = _regular_file(TASK_ROOT / "evaluator.py", "evaluator")
     instruction = _regular_file(TASK_ROOT / "instruction.txt", "instruction")
 
@@ -154,6 +155,12 @@ def main() -> int:
     parser.add_argument("--target-repo", type=Path, default=DEFAULT_TARGET_REPO)
     parser.add_argument("--codex-config", type=Path, default=DEFAULT_CODEX_CONFIG)
     parser.add_argument("--codex-auth", type=Path, default=DEFAULT_CODEX_AUTH)
+    parser.add_argument(
+        "--init-program",
+        type=Path,
+        default=DEFAULT_INIT_PROGRAM,
+        help="Initial marked candidate; use a prior best_program.txt for a fresh continuation",
+    )
     parser.add_argument("--output-path", type=Path, default=None)
     parser.add_argument("--slot-root", type=Path, default=None)
     parser.add_argument("--resume", type=Path, default=None)

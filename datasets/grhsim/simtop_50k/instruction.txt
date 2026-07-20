@@ -53,5 +53,7 @@ Hard constraints:
    performance result.
 6. Prefer a small, attributable candidate. Do not bundle unrelated ideas.
 
-The initial program is the special no-op control. Every generated candidate
-must contain both a non-empty patch and at least one `enable_options` entry.
+The initial program is either the special no-op control or a previously
+evaluated best candidate supplied for a fresh continuation run. Regardless of
+the seed, every newly generated candidate must contain both a non-empty patch
+and at least one `enable_options` entry.

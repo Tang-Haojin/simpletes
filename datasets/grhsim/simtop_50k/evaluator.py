@@ -203,6 +203,16 @@ _SECRET_TEXT_PATTERNS = (
 )
 
 _ROOT_REQUIRED_SUBMODULES = {"wolvrix", "testcase/xiangshan"}
+_GENERATION_INPUT_ROOTS: tuple[tuple[Path, frozenset[str] | None], ...] = (
+    (Path("build/xs/rtl/rtl"), frozenset({".sv", ".v"})),
+    (Path("testcase/xiangshan/build/generated-src"), None),
+)
+_REQUIRED_GENERATION_INPUTS = frozenset(
+    {
+        "build/xs/rtl/rtl/SimTop.sv",
+        "testcase/xiangshan/build/generated-src/DifftestMacros.svh",
+    }
+)
 _SCRUBBED_ENV_PREFIXES = (
     "WOLVRIX_XS_GRHSIM_",
     "WOLVRIX_GRHSIM_",
@@ -654,6 +664,117 @@ def _sha256_file(path: Path) -> str:
         for chunk in iter(lambda: stream.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _generation_input_files(repo: Path) -> tuple[tuple[str, Path], ...]:
+    """Return the fixed HDL/difftest inputs consumed by the GrhSIM build."""
+    repo_root = repo.resolve()
+    rows: list[tuple[str, Path]] = []
+    for relative_root, suffixes in _GENERATION_INPUT_ROOTS:
+        root = repo_root / relative_root
+        if not root.is_dir() or root.is_symlink():
+            raise InfrastructureError(f"generation input directory is missing or unsafe: {root}")
+        try:
+            descendants = sorted(root.rglob("*"))
+        except OSError as exc:
+            raise InfrastructureError(
+                f"failed to enumerate generation inputs under {root}: {exc}"
+            ) from None
+        for path in descendants:
+            if path.is_symlink():
+                raise InfrastructureError(f"generation input may not be a symlink: {path}")
+            if path.is_dir():
+                continue
+            if not path.is_file():
+                raise InfrastructureError(f"generation input is not a regular file: {path}")
+            if suffixes is not None and path.suffix not in suffixes:
+                continue
+            try:
+                relative = path.relative_to(repo_root).as_posix()
+            except ValueError:
+                raise InfrastructureError(
+                    f"generation input escaped its repository: {path}"
+                ) from None
+            rows.append((relative, path))
+
+    rows.sort(key=lambda row: row[0])
+    names = {relative for relative, _path in rows}
+    missing = sorted(_REQUIRED_GENERATION_INPUTS - names)
+    if missing:
+        raise InfrastructureError(f"required generation inputs are missing: {missing}")
+    return tuple(rows)
+
+
+def _generation_input_fingerprint_from_files(files: Sequence[tuple[str, Path]]) -> str:
+    digest = hashlib.sha256()
+    digest.update(b"simpletes-grhsim-generation-input-v1\0")
+    digest.update(len(files).to_bytes(8, "big"))
+    for relative, path in files:
+        encoded = relative.encode("utf-8")
+        digest.update(len(encoded).to_bytes(8, "big"))
+        digest.update(encoded)
+        try:
+            size = path.stat().st_size
+            digest.update(size.to_bytes(8, "big"))
+            with path.open("rb") as stream:
+                for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                    digest.update(chunk)
+        except OSError as exc:
+            raise InfrastructureError(f"failed to hash generation input {path}: {exc}") from None
+    return digest.hexdigest()
+
+
+def generation_input_fingerprint(repo: Path) -> str:
+    return _generation_input_fingerprint_from_files(_generation_input_files(repo))
+
+
+def _stage_control_generation_inputs(control_repo: Path, candidate_repo: Path) -> str:
+    """Copy a private, byte-exact control RTL snapshot into a fresh candidate."""
+    control_files = _generation_input_files(control_repo)
+    expected = _generation_input_fingerprint_from_files(control_files)
+    candidate_root = candidate_repo.resolve()
+
+    for relative, source in control_files:
+        destination = candidate_root / relative
+        if destination.exists() or destination.is_symlink():
+            raise InfrastructureError(
+                f"candidate generation-input destination already exists: {destination}"
+            )
+        try:
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, destination)
+            source_stat = source.stat()
+            destination_stat = destination.stat()
+        except OSError as exc:
+            raise InfrastructureError(
+                f"failed to stage generation input {relative}: {exc}"
+            ) from None
+        if (
+            source_stat.st_dev == destination_stat.st_dev
+            and source_stat.st_ino == destination_stat.st_ino
+        ):
+            raise InfrastructureError(
+                f"candidate generation input is not a private copy: {relative}"
+            )
+
+    control_after = generation_input_fingerprint(control_repo)
+    candidate_after = generation_input_fingerprint(candidate_repo)
+    if control_after != expected or candidate_after != expected:
+        raise InfrastructureError(
+            "failed to stage a stable byte-exact control generation-input snapshot"
+        )
+    return expected
+
+
+def _verify_generation_inputs_unchanged(
+    repo: Path, expected: str, *, phase: str
+) -> None:
+    actual = generation_input_fingerprint(repo)
+    if actual != expected:
+        raise InfrastructureError(
+            "fixed generation inputs drifted "
+            f"{phase}: expected={expected}, actual={actual}"
+        )
 
 
 def _build_config_fingerprint(
@@ -1370,6 +1491,9 @@ def _prepare_artifacts(candidate: Candidate, slot: Slot) -> tuple[BuildArtifacts
         )
 
     candidate_env = _prepare_candidate_clone(slot.control_repo, slot.root, slot.candidate_repo)
+    generation_inputs = _stage_control_generation_inputs(
+        slot.control_repo, slot.candidate_repo
+    )
     # Attribute executable changes to the patch rather than to an existing
     # historical knob alone.  This unpatched/same-options build is a static
     # causal gate; formal runtime still compares against current-default as
@@ -1380,6 +1504,11 @@ def _prepare_artifacts(candidate: Candidate, slot: Slot) -> tuple[BuildArtifacts
         options=candidate.enable_options,
         results_dir=slot.results_dir,
     )
+    _verify_generation_inputs_unchanged(
+        slot.candidate_repo,
+        generation_inputs,
+        phase="after the unpatched same-options emit",
+    )
     _apply_candidate_patch(candidate, slot.candidate_repo, candidate_env)
     disabled = _build_variant(
         slot.candidate_repo,
@@ -1389,6 +1518,11 @@ def _prepare_artifacts(candidate: Candidate, slot: Slot) -> tuple[BuildArtifacts
         clean_first=True,
         candidate_owned=True,
         trusted_tests_repo=slot.control_repo,
+    )
+    _verify_generation_inputs_unchanged(
+        slot.candidate_repo,
+        generation_inputs,
+        phase="after the default-off candidate build",
     )
     if disabled.build_config_fingerprint != control.build_config_fingerprint:
         raise InfrastructureError(
@@ -1411,6 +1545,11 @@ def _prepare_artifacts(candidate: Candidate, slot: Slot) -> tuple[BuildArtifacts
         clean_first=True,
         candidate_owned=True,
         trusted_tests_repo=slot.control_repo,
+    )
+    _verify_generation_inputs_unchanged(
+        slot.candidate_repo,
+        generation_inputs,
+        phase="after the enabled candidate build",
     )
     if enabled.generated_fingerprint == control.generated_fingerprint:
         raise CandidateError(

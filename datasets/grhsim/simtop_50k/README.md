@@ -14,7 +14,7 @@ data are diagnostics, not substitute objectives. Retryable host-load or audit
 failures are retried as the same candidate and do not count toward the valid
 candidate budget.
 
-## Start or resume
+## Start, resume, or continue from the best candidate
 
 The launcher fixes the requested model to `gpt-5.6-sol` with reasoning effort
 `ultra`, uses four RPUCG chains with `k=1`, serial generation/evaluation, stops
@@ -28,8 +28,9 @@ placed in argv, environment variables, logs, metrics, or checkpoints.
 
 ```bash
 cd SimpleTES
-python datasets/grhsim/simtop_50k/launcher.py --dry-run
-python datasets/grhsim/simtop_50k/launcher.py
+source ../wolvrix-playground-gsim-calibrate-5/env.sh
+./.venv/bin/python datasets/grhsim/simtop_50k/launcher.py --dry-run
+./.venv/bin/python datasets/grhsim/simtop_50k/launcher.py
 ```
 
 Defaults:
@@ -37,12 +38,35 @@ Defaults:
 - target checkout: sibling `wolvrix-playground-gsim-calibrate-5`
 - config: `~/.codex/config.mjy.toml`
 - auth: `~/.codex/auth.mjy.json`
+- initial program: `datasets/grhsim/simtop_50k/init_program.txt`
 - evaluator slots: `/tmp/simpletes-grhsim-simtop-50k`
 - checkpoints: `SimpleTES/checkpoints/grhsim_simtop_50k/<timestamp>`
 
 Use `--resume CHECKPOINT`, and keep the same target/slot roots, to continue a
-gracefully stopped run. Build/perf/staging/checkpoint artifacts are deliberately
-untracked.
+gracefully stopped run within its original proposal budget. When resuming a run
+that was itself best-seeded, repeat the same `--init-program` argument because
+runtime configuration is supplied by the current launcher invocation.
+
+```bash
+./.venv/bin/python datasets/grhsim/simtop_50k/launcher.py \
+  --resume checkpoints/grhsim_simtop_50k/<run>/<date>/instance-<id>
+```
+
+Once a run has exhausted its proposal budget, start a new instance seeded by
+the previous instance's `best_program.txt` instead of trying to enlarge the old
+checkpoint's chain budgets:
+
+```bash
+./.venv/bin/python datasets/grhsim/simtop_50k/launcher.py \
+  --init-program checkpoints/grhsim_simtop_50k/<run>/<date>/instance-<id>/db_state_<time>/best_program.txt
+```
+
+The seed must be a regular, non-symlink file containing a complete marked
+candidate document. It is evaluated again as the new instance's initial node;
+that initial evaluation does not consume a proposal or valid-candidate slot.
+Omit `--resume` for this continuation so the launcher creates a fresh checkpoint
+instance with a fresh bounded search budget. Build/perf/staging/checkpoint
+artifacts are deliberately untracked.
 
 ## Candidate and promotion rules
 
@@ -66,6 +90,13 @@ used. Only candidates with consistent positive walltime are eligible for later
 code retention/default promotion. Promotion documentation and commits belong
 in `pdocs/grhsim_opt_thj` under its `RULES.md`; evaluator artifacts themselves
 must not be committed.
+
+Before any candidate emit, the evaluator copies the cached control's generated
+`.sv`/`.v` RTL and XiangShan difftest generated sources into private candidate
+files. A content manifest is checked after the unpatched-options, disabled, and
+enabled phases. This keeps the byte-exact default-off comparison on identical
+elaboration inputs while still preventing a candidate from mutating the cached
+control.
 
 The cached control is reused only when its pinned revisions, copied `env.sh`,
 fixed build configuration, resolved toolchain fingerprint, generated-source

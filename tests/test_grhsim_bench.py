@@ -817,6 +817,42 @@ def test_launcher_uses_explicit_best_program_as_initial_seed(tmp_path: Path):
     assert "--resume" not in command
 
 
+def test_launcher_accepts_long_bounded_continuation_and_rejects_oversize_budget(
+    tmp_path: Path,
+):
+    target = tmp_path / "target"
+    (target / ".git").mkdir(parents=True)
+    (target / "env.sh").write_text("true\n", encoding="utf-8")
+    config = tmp_path / "config.mjy.toml"
+    auth = tmp_path / "auth.mjy.json"
+    config.write_text("model_provider = 'mjy'\n", encoding="utf-8")
+    auth.write_text("{}\n", encoding="utf-8")
+    args = SimpleNamespace(
+        target_repo=target,
+        codex_config=config,
+        codex_auth=auth,
+        init_program=launcher.DEFAULT_INIT_PROGRAM,
+        output_path=tmp_path / "checkpoints",
+        slot_root=tmp_path / "slots",
+        resume=None,
+        max_proposals=32,
+        valid_target=16,
+        eval_timeout=21_600.0,
+        llm_timeout=5_400.0,
+        max_tokens=32_768,
+    )
+
+    command, _environment = launcher.build_command(args)
+    rendered = " ".join(command)
+    assert "--max-generations 32" in rendered
+    assert "--max-valid-evaluations 16" in rendered
+    assert "--timeout 5400.0" in rendered
+
+    args.max_proposals = launcher.MAX_PROPOSALS + 1
+    with pytest.raises(SystemExit, match=r"--max-proposals must be in 1\.\.64"):
+        launcher.build_command(args)
+
+
 def test_launcher_rejects_symlinked_explicit_initial_seed(tmp_path: Path):
     target = tmp_path / "target"
     (target / ".git").mkdir(parents=True)

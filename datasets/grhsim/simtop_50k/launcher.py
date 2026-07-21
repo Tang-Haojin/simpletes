@@ -20,6 +20,7 @@ DEFAULT_CODEX_AUTH = Path("~/.codex/auth.mjy.json").expanduser()
 DEFAULT_INIT_PROGRAM = TASK_ROOT / "init_program.txt"
 MODEL = "gpt-5.6-sol"
 REASONING_EFFORT = "ultra"
+MAX_PROPOSALS = 64
 
 
 def _regular_file(path: Path, label: str) -> Path:
@@ -44,8 +45,8 @@ def build_command(args: argparse.Namespace) -> tuple[list[str], dict[str, str]]:
     evaluator = _regular_file(TASK_ROOT / "evaluator.py", "evaluator")
     instruction = _regular_file(TASK_ROOT / "instruction.txt", "instruction")
 
-    if not 1 <= args.max_proposals <= 16:
-        raise SystemExit("--max-proposals must be in 1..16")
+    if not 1 <= args.max_proposals <= MAX_PROPOSALS:
+        raise SystemExit(f"--max-proposals must be in 1..{MAX_PROPOSALS}")
     if not 1 <= args.valid_target <= args.max_proposals:
         raise SystemExit("--valid-target must be in 1..max-proposals")
 

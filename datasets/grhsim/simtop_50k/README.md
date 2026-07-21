@@ -68,6 +68,24 @@ Omit `--resume` for this continuation so the launcher creates a fresh checkpoint
 instance with a fresh bounded search budget. Build/perf/staging/checkpoint
 artifacts are deliberately untracked.
 
+The default budget remains `16` proposals / `8` valid candidates. Longer fresh
+continuations may explicitly request up to `64` proposals; keep the valid target
+at or below the proposal budget. For example, a doubled search uses:
+
+```bash
+GRHSIM_INFRA_RETRIES=4 \
+./.venv/bin/python datasets/grhsim/simtop_50k/launcher.py \
+  --init-program checkpoints/grhsim_simtop_50k/<run>/<date>/instance-<id>/db_state_<time>/best_program.txt \
+  --max-proposals 32 \
+  --valid-target 16 \
+  --llm-timeout 5400
+```
+
+`GRHSIM_INFRA_RETRIES=4` keeps up to five quiet-CCD runtime attempts inside one
+already-built evaluator invocation. It does not relax any runtime gate. A fresh
+long continuation must still omit `--resume`, so the larger limits apply to a
+new instance rather than mutating an exhausted checkpoint.
+
 ## Candidate and promotion rules
 
 `candidate.schema.json` is the model output contract. Patch paths are limited

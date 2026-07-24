@@ -27,6 +27,7 @@ def _load(name: str, path: Path):
 
 evaluator = _load("_test_grhsim_evaluator", TASK_ROOT / "evaluator.py")
 launcher = _load("_test_grhsim_launcher", TASK_ROOT / "launcher.py")
+retry_runtime = _load("_test_grhsim_retry_runtime", TASK_ROOT / "retry_runtime.py")
 
 
 VALID_PATCH = """diff --git a/lib/example.cpp b/lib/example.cpp
@@ -655,7 +656,524 @@ def _artifacts(tmp_path: Path, name: str):
         image=repo / "image",
         nemu=repo / "nemu",
         generated_fingerprint=name * 16,
+        candidate_proof_id="1" * 32,
+        candidate_proof_sha256="2" * 64,
     )
+
+
+def _publish_retry_attempt(proof, *, error="quiet CCD"):
+    runtime = {
+        "valid": False,
+        "infrastructure_retry": True,
+        "retryable_infra": True,
+        "error": error,
+        "samples": [],
+    }
+    metrics = {
+        "combined_score": 0.0,
+        "validity": 0.0,
+        "valid_candidate": 0,
+        "infrastructure_retry": 1.0,
+        "retryable_infra": 1.0,
+        "retry_after_s": 30.0,
+        "error": error,
+        "candidate_files": 1,
+        "enable_option_count": 1,
+        "parent_commit": proof.ev.PINNED_PARENT_COMMIT[:12],
+        "wolvrix_commit": proof.ev.PINNED_WOLVRIX_COMMIT[:12],
+        "control_generated_fingerprint": proof.control.generated_fingerprint[:16],
+        "candidate_generated_fingerprint": proof.enabled.generated_fingerprint[:16],
+    }
+    result = proof.ev._publish_evaluation_attempt(
+        proof.slot, proof.candidate, proof.enabled, runtime, metrics
+    )
+    attempts_root = proof.slot.results_dir / "attempts" / proof.candidate.digest
+    attempt_dir = attempts_root / result["attempt_id"]
+    proof.attempt_dir = attempt_dir
+    proof.runtime_path = attempt_dir / "runtime_result.json"
+    proof.evaluation_path = attempt_dir / "evaluation.json"
+    proof.complete_path = attempt_dir / "complete.json"
+    return result
+
+
+def _rewrite_attempt_document(proof, name: str, update):
+    path = proof.attempt_dir / name
+    value = json.loads(path.read_text(encoding="utf-8"))
+    update(value)
+    digest = proof.ev._atomic_write_json(path, value)
+    complete = json.loads(proof.complete_path.read_text(encoding="utf-8"))
+    key = "runtime_result_sha256" if name == "runtime_result.json" else "evaluation_sha256"
+    complete[key] = digest
+    proof.ev._atomic_write_json(proof.complete_path, complete)
+
+
+def _runtime_retry_proof(monkeypatch, tmp_path: Path):
+    ev = retry_runtime.evaluator
+    candidate = ev.parse_candidate_text(
+        _candidate_text(options={"active_mask_gap_pack_policy": "targeted-direct"})
+    )
+    slot_root = tmp_path / "slot-0"
+    control_repo = slot_root / "control"
+    candidate_repo = slot_root / "candidate"
+    results = slot_root / "results"
+    for repo in (control_repo, candidate_repo):
+        repo.mkdir(parents=True)
+        (repo / "env.sh").write_text("same env\n", encoding="utf-8")
+    results.mkdir()
+    slot = ev.Slot(slot_root, control_repo, candidate_repo, results, None)
+
+    artifacts_by_repo = {}
+    for repo, binary_data in (
+        (control_repo, b"control-binary"),
+        (candidate_repo, b"candidate-binary"),
+    ):
+        binary = repo / "emu"
+        image = repo / "image"
+        nemu = repo / "nemu"
+        binary.write_bytes(binary_data)
+        image.write_bytes(b"same-image")
+        nemu.write_bytes(b"same-nemu")
+        artifacts_by_repo[repo] = (binary, image, nemu)
+
+    control_generated = "c" * 64
+    candidate_generated = "d" * 64
+    monkeypatch.setattr(ev, "_verify_pinned_repo", lambda *_args: None)
+    monkeypatch.setattr(ev, "_artifact_paths", lambda repo: artifacts_by_repo[repo])
+    monkeypatch.setattr(
+        ev,
+        "generated_fingerprint",
+        lambda repo: control_generated if repo == control_repo else candidate_generated,
+    )
+    monkeypatch.setattr(
+        ev,
+        "_build_config_fingerprint",
+        lambda options, *, jobs: "a" * 64 if not options else "b" * 64,
+    )
+    monkeypatch.setattr(ev, "_toolchain_fingerprint", lambda *_args: "e" * 64)
+    monkeypatch.setattr(
+        ev,
+        "_build_variant",
+        lambda *_args, **_kwargs: pytest.fail("runtime-only retry attempted a build"),
+    )
+
+    control_binary, control_image, control_nemu = artifacts_by_repo[control_repo]
+    control = ev.BuildArtifacts(
+        name="control",
+        repo=control_repo,
+        binary=control_binary,
+        image=control_image,
+        nemu=control_nemu,
+        generated_fingerprint=control_generated,
+        build_log=results / "control_build.log",
+        build_config_fingerprint="a" * 64,
+        toolchain_fingerprint="e" * 64,
+    )
+    ev._atomic_write_json(
+        results / "control_artifacts.json",
+        {
+            "schema_version": ev.CONTROL_MARKER_SCHEMA_VERSION,
+            "name": "control",
+            "repo": str(control_repo),
+            "binary": str(control_binary),
+            "image": str(control_image),
+            "nemu": str(control_nemu),
+            "generated_fingerprint": control_generated,
+            "build_log": str(results / "control_build.log"),
+            "build_config_fingerprint": "a" * 64,
+            "toolchain_fingerprint": "e" * 64,
+            "parent_commit": ev.PINNED_PARENT_COMMIT,
+            "wolvrix_commit": ev.PINNED_WOLVRIX_COMMIT,
+            "artifact_sha256": {
+                "binary": ev._sha256_file(control_binary),
+                "image": ev._sha256_file(control_image),
+                "nemu": ev._sha256_file(control_nemu),
+            },
+        },
+    )
+
+    patch_path = slot_root / "candidate.patch"
+    patch_path.write_text(candidate.patch, encoding="utf-8")
+    candidate_binary, candidate_image, candidate_nemu = artifacts_by_repo[candidate_repo]
+    enabled = ev.BuildArtifacts(
+        name=f"candidate_{candidate.digest[:12]}_enabled",
+        repo=candidate_repo,
+        binary=candidate_binary,
+        image=candidate_image,
+        nemu=candidate_nemu,
+        generated_fingerprint=candidate_generated,
+        build_log=results / f"candidate_{candidate.digest[:12]}_enabled_build.log",
+        build_config_fingerprint="b" * 64,
+        toolchain_fingerprint="e" * 64,
+    )
+    enabled = ev._write_candidate_proof(candidate, slot, control, enabled)
+    proof = SimpleNamespace(
+        ev=ev,
+        candidate=candidate,
+        slot=slot,
+        control=control,
+        enabled=enabled,
+        control_repo=control_repo,
+        candidate_repo=candidate_repo,
+        control_binary=control_binary,
+        candidate_binary=candidate_binary,
+        candidate_image=candidate_image,
+        candidate_env=candidate_repo / "env.sh",
+        patch_path=patch_path,
+        proof_path=ev._candidate_proof_path(slot, candidate),
+    )
+    _publish_retry_attempt(proof)
+    return proof
+
+
+def test_runtime_only_retry_reuses_complete_proof_without_building(
+    monkeypatch, tmp_path: Path
+):
+    proof = _runtime_retry_proof(monkeypatch, tmp_path)
+
+    control, candidate = retry_runtime.prepare_reused_artifacts(
+        proof.candidate, proof.slot
+    )
+
+    assert control.name == "control"
+    assert candidate.name == f"candidate_{proof.candidate.digest[:12]}_enabled"
+    assert candidate.generated_fingerprint == "d" * 64
+    marker = json.loads(proof.proof_path.read_text(encoding="utf-8"))
+    assert set(marker) == retry_runtime._CANDIDATE_PROOF_FIELDS
+    assert marker["schema_version"] == proof.ev.CANDIDATE_PROOF_SCHEMA_VERSION
+    assert marker["proof_version"] == proof.ev.CANDIDATE_PROOF_VERSION
+    assert marker["candidate_digest"] == proof.candidate.digest
+    assert marker["artifacts"]["binary"]["sha256"] == proof.ev._sha256_file(
+        proof.candidate_binary
+    )
+    assert marker["env_sh"]["candidate_sha256"] == marker["env_sh"]["control_sha256"]
+    assert candidate.candidate_proof_sha256 == proof.ev._sha256_file(proof.proof_path)
+
+
+def test_runtime_only_retry_rejects_digest_patch_and_fingerprint_mismatches(
+    monkeypatch, tmp_path: Path
+):
+    proof = _runtime_retry_proof(monkeypatch, tmp_path)
+    _rewrite_attempt_document(
+        proof, "evaluation.json", lambda value: value.__setitem__("candidate_digest", "0" * 16)
+    )
+    with pytest.raises(proof.ev.InfrastructureError, match="candidate_digest"):
+        retry_runtime.prepare_reused_artifacts(proof.candidate, proof.slot)
+
+    proof = _runtime_retry_proof(monkeypatch, tmp_path / "patch")
+    proof.patch_path.write_text("not the requested patch\n", encoding="utf-8")
+    with pytest.raises(proof.ev.CandidateError, match="does not exactly match"):
+        retry_runtime.prepare_reused_artifacts(proof.candidate, proof.slot)
+
+    proof = _runtime_retry_proof(monkeypatch, tmp_path / "fingerprint")
+    marker = json.loads(proof.proof_path.read_text(encoding="utf-8"))
+    marker["generated_fingerprint"] = "e" * 64
+    proof.ev._atomic_write_json(proof.proof_path, marker)
+    with pytest.raises(proof.ev.InfrastructureError, match="proof binding differs"):
+        retry_runtime.prepare_reused_artifacts(proof.candidate, proof.slot)
+
+
+def test_runtime_only_retry_rejects_pinned_control_sha_and_input_failures(
+    monkeypatch, tmp_path: Path
+):
+    proof = _runtime_retry_proof(monkeypatch, tmp_path / "pinned")
+    monkeypatch.setattr(
+        proof.ev,
+        "_verify_pinned_repo",
+        lambda *_args: (_ for _ in ()).throw(proof.ev.InfrastructureError("not pinned")),
+    )
+    with pytest.raises(proof.ev.InfrastructureError, match="not pinned"):
+        retry_runtime.prepare_reused_artifacts(proof.candidate, proof.slot)
+
+    proof = _runtime_retry_proof(monkeypatch, tmp_path / "control-sha")
+    proof.control_binary.write_bytes(b"mutated-control")
+    with pytest.raises(proof.ev.InfrastructureError, match="artifact_sha256"):
+        retry_runtime.prepare_reused_artifacts(proof.candidate, proof.slot)
+
+    proof = _runtime_retry_proof(monkeypatch, tmp_path / "inputs")
+    proof.candidate_image.write_bytes(b"different-image")
+    with pytest.raises(proof.ev.InfrastructureError, match="image SHA-256 differs"):
+        retry_runtime.prepare_reused_artifacts(proof.candidate, proof.slot)
+
+
+def test_runtime_only_retry_rejects_candidate_binary_symlink_and_env_changes(
+    monkeypatch, tmp_path: Path
+):
+    proof = _runtime_retry_proof(monkeypatch, tmp_path / "binary")
+    proof.candidate_binary.write_bytes(b"mutated-binary")
+    with pytest.raises(proof.ev.InfrastructureError, match="binary SHA-256 differs"):
+        retry_runtime.prepare_reused_artifacts(proof.candidate, proof.slot)
+
+    proof = _runtime_retry_proof(monkeypatch, tmp_path / "symlink")
+    proof.candidate_binary.unlink()
+    proof.candidate_binary.symlink_to(proof.control_binary)
+    with pytest.raises(proof.ev.InfrastructureError, match="non-regular artifact"):
+        retry_runtime.prepare_reused_artifacts(proof.candidate, proof.slot)
+
+    proof = _runtime_retry_proof(monkeypatch, tmp_path / "env")
+    proof.candidate_env.unlink()
+    proof.candidate_env.symlink_to(proof.control_repo / "env.sh")
+    with pytest.raises(proof.ev.InfrastructureError, match="candidate env.sh"):
+        retry_runtime.prepare_reused_artifacts(proof.candidate, proof.slot)
+
+
+def test_runtime_only_retry_requires_strict_manifest_schema_and_flag_types(
+    monkeypatch, tmp_path: Path
+):
+    proof = _runtime_retry_proof(monkeypatch, tmp_path / "flags")
+    _rewrite_attempt_document(
+        proof,
+        "evaluation.json",
+        lambda value: value.__setitem__("infrastructure_retry", 1),
+    )
+    with pytest.raises(proof.ev.CandidateError, match="evaluation.infrastructure_retry"):
+        retry_runtime.prepare_reused_artifacts(proof.candidate, proof.slot)
+
+    proof = _runtime_retry_proof(monkeypatch, tmp_path / "schema")
+    _rewrite_attempt_document(
+        proof,
+        "runtime_result.json",
+        lambda value: value.__setitem__("schema_version", True),
+    )
+    with pytest.raises(proof.ev.InfrastructureError, match="schema_version"):
+        retry_runtime.prepare_reused_artifacts(proof.candidate, proof.slot)
+
+    proof = _runtime_retry_proof(monkeypatch, tmp_path / "proof-schema")
+    marker = json.loads(proof.proof_path.read_text(encoding="utf-8"))
+    marker["schema_version"] = True
+    proof.ev._atomic_write_json(proof.proof_path, marker)
+    with pytest.raises(proof.ev.InfrastructureError, match="malformed fields"):
+        retry_runtime.prepare_reused_artifacts(proof.candidate, proof.slot)
+
+
+def test_runtime_only_retry_uses_immutable_attempt_when_latest_publish_is_interrupted(
+    monkeypatch, tmp_path: Path
+):
+    proof = _runtime_retry_proof(monkeypatch, tmp_path)
+    digest = proof.candidate.digest[:16]
+    (proof.slot.results_dir / f"runtime_result_{digest}.json").write_text(
+        "{}\n", encoding="utf-8"
+    )
+    incomplete = (
+        proof.slot.results_dir
+        / "attempts"
+        / proof.candidate.digest
+        / "99999999999999999999-interrupted"
+    )
+    incomplete.mkdir()
+    (incomplete / "runtime_result.json").write_text("{}\n", encoding="utf-8")
+
+    control, enabled = retry_runtime.prepare_reused_artifacts(
+        proof.candidate, proof.slot
+    )
+
+    assert control.name == "control"
+    assert enabled.candidate_proof_id == proof.enabled.candidate_proof_id
+
+
+def test_alias_publish_failure_leaves_no_complete_and_preserves_prior_retry(
+    monkeypatch, tmp_path: Path
+):
+    proof = _runtime_retry_proof(monkeypatch, tmp_path)
+    attempts_root = proof.slot.results_dir / "attempts" / proof.candidate.digest
+    existing = set(attempts_root.iterdir())
+    original_atomic_write = proof.ev._atomic_write_json
+    failing_alias = (
+        proof.slot.results_dir / f"evaluation_{proof.candidate.digest[:16]}.json"
+    )
+
+    def fail_second_alias(path, value):
+        if path == failing_alias:
+            raise OSError("injected compatibility alias failure")
+        return original_atomic_write(path, value)
+
+    monkeypatch.setattr(proof.ev, "_atomic_write_json", fail_second_alias)
+    with pytest.raises(OSError, match="alias failure"):
+        _publish_retry_attempt(proof, error="incomplete retry")
+    created = set(attempts_root.iterdir()) - existing
+    assert len(created) == 1
+    assert not (next(iter(created)) / "complete.json").exists()
+
+    monkeypatch.setattr(proof.ev, "_atomic_write_json", original_atomic_write)
+    control, enabled = retry_runtime.prepare_reused_artifacts(
+        proof.candidate, proof.slot
+    )
+    assert control.name == "control"
+    assert enabled.candidate_proof_id == proof.enabled.candidate_proof_id
+
+
+def test_runtime_only_retry_accepts_latest_retry_of_retry(monkeypatch, tmp_path: Path):
+    proof = _runtime_retry_proof(monkeypatch, tmp_path)
+    second = _publish_retry_attempt(proof, error="second retry")
+
+    _runtime, evaluation = retry_runtime._load_latest_complete_attempt(
+        proof.candidate,
+        proof.slot,
+        proof.enabled.candidate_proof_id,
+        proof.enabled.candidate_proof_sha256,
+    )
+
+    assert evaluation["attempt_id"] == second["attempt_id"]
+    assert evaluation["error"] == "second retry"
+
+
+def test_attempt_publish_requires_proof_for_noncontrol_and_uses_control_sentinel(
+    monkeypatch, tmp_path: Path
+):
+    proof = _runtime_retry_proof(monkeypatch, tmp_path)
+    attempts_root = proof.slot.results_dir / "attempts" / proof.candidate.digest
+    before = set(attempts_root.iterdir())
+    unproven = SimpleNamespace(candidate_proof_id="", candidate_proof_sha256="")
+    with pytest.raises(proof.ev.InfrastructureError, match="valid candidate proof id"):
+        proof.ev._publish_evaluation_attempt(
+            proof.slot,
+            proof.candidate,
+            unproven,
+            {"valid": False},
+            {"valid_candidate": 0},
+        )
+    assert set(attempts_root.iterdir()) == before
+
+    control_candidate = proof.ev.parse_candidate_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "hypothesis": "control",
+                "evidence": ["control"],
+                "patch": "",
+                "enable_options": {},
+            }
+        )
+    )
+    published = proof.ev._publish_evaluation_attempt(
+        proof.slot,
+        control_candidate,
+        unproven,
+        {"valid": False},
+        {"valid_candidate": 0},
+    )
+    assert published["candidate_proof_id"] == proof.ev.CONTROL_CANDIDATE_PROOF_ID
+    assert (
+        published["candidate_proof_sha256"]
+        == proof.ev.CONTROL_CANDIDATE_PROOF_SHA256
+    )
+
+
+def _existing_retry_slot(tmp_path: Path):
+    source = tmp_path / "source"
+    source.mkdir(parents=True)
+    root = tmp_path / "slots"
+    root.mkdir()
+    namespace = retry_runtime.hashlib.sha256(
+        f"{source.resolve()}\0{retry_runtime.evaluator.PINNED_PARENT_COMMIT}\0"
+        f"{retry_runtime.evaluator.PINNED_WOLVRIX_COMMIT}".encode("utf-8")
+    ).hexdigest()[:16]
+    slot = root / namespace / "slot-0"
+    (slot / "control").mkdir(parents=True)
+    (slot / "candidate").mkdir()
+    (slot / "results").mkdir()
+    (slot / "lock").write_text("", encoding="utf-8")
+    return source, root, slot
+
+
+def test_runtime_only_lock_rejects_symlink_and_nonregular_lock(monkeypatch, tmp_path: Path):
+    source, root, slot = _existing_retry_slot(tmp_path / "symlink")
+    target = slot / "lock-target"
+    target.write_text("", encoding="utf-8")
+    (slot / "lock").unlink()
+    (slot / "lock").symlink_to(target)
+    monkeypatch.setenv("GRHSIM_SLOT_LOCK_TIMEOUT", "0")
+    with pytest.raises(retry_runtime.evaluator.InfrastructureError):
+        with retry_runtime.acquire_existing_slot(source, root):
+            pass
+
+    source, root, slot = _existing_retry_slot(tmp_path / "directory")
+    (slot / "lock").unlink()
+    (slot / "lock").mkdir()
+    with pytest.raises(retry_runtime.evaluator.InfrastructureError):
+        with retry_runtime.acquire_existing_slot(source, root):
+            pass
+
+
+def test_runtime_only_lock_rejects_symlinked_root_and_releases_after_context(
+    monkeypatch, tmp_path: Path
+):
+    source, real_root, _slot = _existing_retry_slot(tmp_path / "root")
+    linked_root = tmp_path / "linked-slots"
+    linked_root.symlink_to(real_root, target_is_directory=True)
+    with pytest.raises(retry_runtime.evaluator.InfrastructureError, match="symlink"):
+        with retry_runtime.acquire_existing_slot(source, linked_root):
+            pass
+
+    monkeypatch.setenv("GRHSIM_SLOT_LOCK_TIMEOUT", "0")
+    with retry_runtime.acquire_existing_slot(source, real_root):
+        with pytest.raises(retry_runtime.evaluator.InfrastructureError, match="timed out"):
+            with retry_runtime.acquire_existing_slot(source, real_root):
+                pass
+    with retry_runtime.acquire_existing_slot(source, real_root) as slot:
+        assert slot.root == _slot
+
+
+def test_runtime_only_lock_detects_unlink_recreate_after_flock(monkeypatch, tmp_path: Path):
+    source, root, slot = _existing_retry_slot(tmp_path)
+    lock_path = slot / "lock"
+    original_flock = retry_runtime.fcntl.flock
+    replaced = False
+
+    def replace_after_lock(descriptor, operation):
+        nonlocal replaced
+        result = original_flock(descriptor, operation)
+        if operation & retry_runtime.fcntl.LOCK_EX and not replaced:
+            replaced = True
+            lock_path.unlink()
+            lock_path.write_text("replacement", encoding="utf-8")
+        return result
+
+    monkeypatch.setattr(retry_runtime.fcntl, "flock", replace_after_lock)
+    with pytest.raises(retry_runtime.evaluator.InfrastructureError, match="replaced"):
+        with retry_runtime.acquire_existing_slot(source, root):
+            pass
+
+    monkeypatch.setattr(retry_runtime.fcntl, "flock", original_flock)
+    with retry_runtime.acquire_existing_slot(source, root) as acquired:
+        assert acquired.root == slot
+
+
+def test_evaluate_accepts_explicit_slot_acquirer(monkeypatch, tmp_path: Path):
+    program = tmp_path / "candidate.txt"
+    program.write_text(_candidate_text(), encoding="utf-8")
+    control = _artifacts(tmp_path, "control-explicit")
+    candidate_artifacts = _artifacts(tmp_path, "candidate-explicit")
+    slot = evaluator.Slot(
+        tmp_path, control.repo, candidate_artifacts.repo, tmp_path, None
+    )
+    acquired = []
+
+    @contextmanager
+    def explicit_acquirer(source_repo, slot_root):
+        acquired.append((source_repo, slot_root))
+        yield slot
+
+    def default_acquirer(*_args, **_kwargs):
+        pytest.fail("default slot acquirer was used")
+
+    monkeypatch.setattr(evaluator, "acquire_slot", default_acquirer)
+    metrics = evaluator.evaluate(
+        str(program),
+        runtime_fn=lambda *_args, **_kwargs: {
+            "valid": True,
+            "control_walltime_ms": 100.0,
+            "candidate_walltime_ms": 101.0,
+            "samples": [],
+            "diagnostics": {},
+        },
+        artifact_preparer=lambda *_args: (control, candidate_artifacts),
+        slot_acquirer=explicit_acquirer,
+        source_repo=tmp_path / "source",
+        slot_root=tmp_path / "slots",
+    )
+
+    assert metrics["valid_candidate"] == 1
+    assert acquired == [(tmp_path / "source", tmp_path / "slots")]
 
 
 def test_evaluate_promotes_positive_abba_with_reversed_baab(monkeypatch, tmp_path: Path):

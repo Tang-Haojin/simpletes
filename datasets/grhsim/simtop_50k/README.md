@@ -86,6 +86,27 @@ already-built evaluator invocation. It does not relax any runtime gate. A fresh
 long continuation must still omit `--resume`, so the larger limits apply to a
 new instance rather than mutating an exhausted checkpoint.
 
+If all in-process runtime attempts fail only because no whole CCD stays quiet,
+reuse the already-gated artifacts with the runtime-only entry point:
+
+```bash
+GRHSIM_INFRA_RETRIES=4 GRHSIM_BUILD_JOBS=4 \
+./.venv/bin/python datasets/grhsim/simtop_50k/retry_runtime.py \
+  /path/to/the/exact/candidate.txt \
+  --source-repo /path/to/wolvrix-playground-gsim-calibrate-5 \
+  --slot-root /tmp/simpletes-grhsim-simtop-50k
+```
+
+The full evaluator writes a versioned proof marker only after attribution,
+default-off, focused, and 100/10k function gates pass. Each runtime result is
+committed as an immutable attempt whose JSON files and candidate proof are
+bound by full SHA-256 values. `retry_runtime.py` holds the same slot lock and
+revalidates the candidate patch/options, pinned revisions, generated output,
+build/toolchain identity, `env.sh`, binary, image, NEMU, and the latest complete
+retryable attempt before invoking the normal ABBA/BAAB path. It never clones,
+emits, builds, or falls back to rebuilding an invalid cache. Results created by
+older evaluator revisions without this proof are deliberately not reusable.
+
 ## Candidate and promotion rules
 
 `candidate.schema.json` is the model output contract. Patch paths are limited

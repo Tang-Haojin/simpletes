@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import argparse
 from contextlib import contextmanager
-from dataclasses import asdict, dataclass, is_dataclass
+from dataclasses import asdict, dataclass, is_dataclass, replace
 import fcntl
 import hashlib
 import importlib.util
@@ -24,11 +24,13 @@ import os
 from pathlib import Path, PurePosixPath
 import re
 import shutil
+import stat
 import statistics
 import subprocess
 import sys
 import time
 from typing import Any, Callable, Iterator, Mapping, Sequence
+import uuid
 
 
 TASK_ROOT = Path(__file__).resolve().parent
@@ -47,6 +49,13 @@ MAX_ENABLE_OPTIONS = 64
 DEFAULT_BUILD_TIMEOUT_SECONDS = 4 * 60 * 60
 DEFAULT_INFRA_RETRIES = 2
 CONTROL_MARKER_SCHEMA_VERSION = 2
+CANDIDATE_PROOF_SCHEMA_VERSION = 1
+CANDIDATE_PROOF_VERSION = 1
+RUNTIME_RESULT_SCHEMA_VERSION = 1
+EVALUATION_RESULT_SCHEMA_VERSION = 1
+EVALUATION_ATTEMPT_SCHEMA_VERSION = 1
+CONTROL_CANDIDATE_PROOF_ID = "control"
+CONTROL_CANDIDATE_PROOF_SHA256 = "0" * 64
 
 _MARKER_START_RE = re.compile(r"(?m)^\s*(?:#|//)?\s*EVOLVE-BLOCK-START\s*$")
 _MARKER_END_RE = re.compile(r"(?m)^\s*(?:#|//)?\s*EVOLVE-BLOCK-END\s*$")
@@ -277,6 +286,8 @@ class BuildArtifacts:
     build_log: Path | None = None
     build_config_fingerprint: str = ""
     toolchain_fingerprint: str = ""
+    candidate_proof_id: str = ""
+    candidate_proof_sha256: str = ""
 
     def runtime_mapping(self) -> dict[str, Any]:
         return {
@@ -666,6 +677,70 @@ def _sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def _json_document_bytes(value: Mapping[str, Any]) -> bytes:
+    return (
+        json.dumps(
+            value,
+            ensure_ascii=False,
+            sort_keys=True,
+            indent=2,
+            default=str,
+        )
+        + "\n"
+    ).encode("utf-8")
+
+
+def _atomic_write_json(path: Path, value: Mapping[str, Any]) -> str:
+    """Atomically publish one JSON document and return its byte SHA-256."""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    data = _json_document_bytes(value)
+    temporary = path.parent / f".{path.name}.tmp-{os.getpid()}-{uuid.uuid4().hex}"
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW
+    descriptor = os.open(temporary, flags, 0o600)
+    try:
+        with os.fdopen(descriptor, "wb", closefd=True) as stream:
+            descriptor = -1
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+        directory_fd = os.open(
+            path.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC
+        )
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    except Exception:
+        if descriptor >= 0:
+            os.close(descriptor)
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+        raise
+    return hashlib.sha256(data).hexdigest()
+
+
+def _open_regular_lock(path: Path, *, create: bool) -> Any:
+    flags = os.O_RDWR | os.O_CLOEXEC | os.O_NOFOLLOW
+    if create:
+        flags |= os.O_CREAT
+    try:
+        descriptor = os.open(path, flags, 0o600)
+    except OSError as error:
+        raise InfrastructureError(f"cannot open evaluator lock safely: {path}: {error}") from error
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise InfrastructureError(f"evaluator lock is not a regular file: {path}")
+        return os.fdopen(descriptor, "r+", encoding="utf-8", closefd=True)
+    except Exception:
+        os.close(descriptor)
+        raise
+
+
 def _generation_input_files(repo: Path) -> tuple[tuple[str, Path], ...]:
     """Return the fixed HDL/difftest inputs consumed by the GrhSIM build."""
     repo_root = repo.resolve()
@@ -1023,7 +1098,7 @@ def acquire_slot(source_repo: Path | None = None, slot_root: Path | None = None)
     slot_root_path = root / namespace / "slot-0"
     slot_root_path.mkdir(parents=True, exist_ok=True)
     lock_path = slot_root_path / "lock"
-    lock_file = lock_path.open("a+", encoding="utf-8")
+    lock_file = _open_regular_lock(lock_path, create=True)
     timeout = float(os.environ.get("GRHSIM_SLOT_LOCK_TIMEOUT", "43200"))
     started = time.monotonic()
     while True:
@@ -1468,11 +1543,80 @@ def _control_artifacts(slot: Slot) -> BuildArtifacts:
         "wolvrix_commit": PINNED_WOLVRIX_COMMIT,
         "artifact_sha256": artifact_sha256,
     }
-    marker.write_text(
-        json.dumps(marker_payload, sort_keys=True, default=str, indent=2) + "\n",
-        encoding="utf-8",
-    )
+    _atomic_write_json(marker, marker_payload)
     return artifacts
+
+
+def _canonical_enable_options(options: Mapping[str, bool | int | float | str]) -> str:
+    return json.dumps(
+        dict(sorted(options.items())),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def _candidate_proof_path(slot: Slot, candidate: Candidate) -> Path:
+    return slot.results_dir / f"candidate_proof_{candidate.digest[:16]}.json"
+
+
+def _write_candidate_proof(
+    candidate: Candidate,
+    slot: Slot,
+    control: BuildArtifacts,
+    enabled: BuildArtifacts,
+) -> BuildArtifacts:
+    candidate_env = enabled.repo / "env.sh"
+    control_env = control.repo / "env.sh"
+    candidate_env_sha256 = _sha256_file(candidate_env)
+    control_env_sha256 = _sha256_file(control_env)
+    if candidate_env_sha256 != control_env_sha256:
+        raise InfrastructureError(
+            "candidate and control env.sh differ after artifact preparation"
+        )
+
+    proof_id = uuid.uuid4().hex
+    payload = {
+        "schema_version": CANDIDATE_PROOF_SCHEMA_VERSION,
+        "proof_version": CANDIDATE_PROOF_VERSION,
+        "proof_id": proof_id,
+        "created_time_ns": time.time_ns(),
+        "candidate_digest": candidate.digest,
+        "patch_sha256": hashlib.sha256(candidate.patch.encode("utf-8")).hexdigest(),
+        "canonical_enable_options": _canonical_enable_options(candidate.enable_options),
+        "parent_commit": PINNED_PARENT_COMMIT,
+        "wolvrix_commit": PINNED_WOLVRIX_COMMIT,
+        "repo": str(enabled.repo.resolve()),
+        "generated_fingerprint": enabled.generated_fingerprint,
+        "build_config_fingerprint": enabled.build_config_fingerprint,
+        "toolchain_fingerprint": enabled.toolchain_fingerprint,
+        "artifacts": {
+            "binary": {
+                "path": str(enabled.binary),
+                "sha256": _sha256_file(enabled.binary),
+            },
+            "image": {
+                "path": str(enabled.image),
+                "sha256": _sha256_file(enabled.image),
+            },
+            "nemu": {
+                "path": str(enabled.nemu),
+                "sha256": _sha256_file(enabled.nemu),
+            },
+        },
+        "env_sh": {
+            "candidate_path": str(candidate_env),
+            "candidate_sha256": candidate_env_sha256,
+            "control_path": str(control_env),
+            "control_sha256": control_env_sha256,
+        },
+    }
+    proof_sha256 = _atomic_write_json(_candidate_proof_path(slot, candidate), payload)
+    return replace(
+        enabled,
+        candidate_proof_id=proof_id,
+        candidate_proof_sha256=proof_sha256,
+    )
 
 
 def _prepare_artifacts(candidate: Candidate, slot: Slot) -> tuple[BuildArtifacts, BuildArtifacts]:
@@ -1561,6 +1705,7 @@ def _prepare_artifacts(candidate: Candidate, slot: Slot) -> tuple[BuildArtifacts
             "enabled candidate is byte-identical to the unpatched same-options build; "
             "the patch has no attributable executable effect"
         )
+    enabled = _write_candidate_proof(candidate, slot, control, enabled)
     return control, enabled
 
 
@@ -1856,11 +2001,92 @@ def _failure(error: Exception, *, retryable: bool = False, elapsed: float = 0.0)
     }
 
 
+def _publish_evaluation_attempt(
+    slot: Slot,
+    candidate: Candidate,
+    enabled: BuildArtifacts,
+    runtime_result: Mapping[str, Any],
+    metrics: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Publish attempt data and compatibility files before the immutable commit point."""
+
+    if candidate.is_control:
+        proof_id = CONTROL_CANDIDATE_PROOF_ID
+        proof_sha256 = CONTROL_CANDIDATE_PROOF_SHA256
+    else:
+        proof_id = enabled.candidate_proof_id
+        proof_sha256 = enabled.candidate_proof_sha256
+        if re.fullmatch(r"[0-9a-f]{32}", proof_id) is None:
+            raise InfrastructureError(
+                "non-control evaluation lacks a valid candidate proof id"
+            )
+        if re.fullmatch(r"[0-9a-f]{64}", proof_sha256) is None:
+            raise InfrastructureError(
+                "non-control evaluation lacks a valid candidate proof SHA-256"
+            )
+
+    created_time_ns = time.time_ns()
+    attempt_id = f"{created_time_ns:020d}-{os.getpid()}-{uuid.uuid4().hex}"
+    common = {
+        "attempt_id": attempt_id,
+        "candidate_digest": candidate.digest[:16],
+        "candidate_digest_full": candidate.digest,
+        "candidate_proof_id": proof_id,
+        "candidate_proof_sha256": proof_sha256,
+    }
+    runtime_payload = {
+        **dict(scrub_secrets(runtime_result)),
+        "schema_version": RUNTIME_RESULT_SCHEMA_VERSION,
+        **common,
+    }
+    evaluation_payload = {
+        **dict(scrub_secrets(metrics)),
+        "schema_version": EVALUATION_RESULT_SCHEMA_VERSION,
+        **common,
+    }
+
+    attempts_root = slot.results_dir / "attempts" / candidate.digest
+    attempts_root.mkdir(parents=True, exist_ok=True)
+    if attempts_root.is_symlink() or not attempts_root.is_dir():
+        raise InfrastructureError(f"unsafe evaluation-attempt root: {attempts_root}")
+    attempt_dir = attempts_root / attempt_id
+    attempt_dir.mkdir(mode=0o700, exist_ok=False)
+    runtime_path = attempt_dir / "runtime_result.json"
+    evaluation_path = attempt_dir / "evaluation.json"
+    runtime_sha256 = _atomic_write_json(runtime_path, runtime_payload)
+    evaluation_sha256 = _atomic_write_json(evaluation_path, evaluation_payload)
+    completion = {
+        "schema_version": EVALUATION_ATTEMPT_SCHEMA_VERSION,
+        "attempt_id": attempt_id,
+        "created_time_ns": created_time_ns,
+        "candidate_digest": candidate.digest,
+        "candidate_proof_id": proof_id,
+        "candidate_proof_sha256": proof_sha256,
+        "runtime_result_sha256": runtime_sha256,
+        "evaluation_sha256": evaluation_sha256,
+    }
+    # These two paths are compatibility aliases for existing SimpleTES runs.
+    # A retry never trusts them because a process can stop between publications.
+    _atomic_write_json(
+        slot.results_dir / f"runtime_result_{candidate.digest[:16]}.json",
+        runtime_payload,
+    )
+    _atomic_write_json(
+        slot.results_dir / f"evaluation_{candidate.digest[:16]}.json",
+        evaluation_payload,
+    )
+    # This is the strict commit point. An attempt with failed compatibility
+    # publication remains incomplete and is never eligible for runtime reuse.
+    _atomic_write_json(attempt_dir / "complete.json", completion)
+    return evaluation_payload
+
+
 def evaluate(
     program_path: str,
     *,
     runtime_fn: Callable[..., Mapping[str, Any]] | None = None,
     artifact_preparer: Callable[[Candidate, Slot], tuple[BuildArtifacts, BuildArtifacts]] | None = None,
+    slot_acquirer: Callable[..., Any] | None = None,
     source_repo: str | os.PathLike[str] | None = None,
     slot_root: str | os.PathLike[str] | None = None,
 ) -> dict[str, Any]:
@@ -1873,8 +2099,9 @@ def evaluate(
 
     runtime_callable = runtime_fn or _invoke_runtime
     prepare = artifact_preparer or _prepare_artifacts
+    acquire = slot_acquirer or acquire_slot
     try:
-        with acquire_slot(
+        with acquire(
             Path(source_repo) if source_repo is not None else None,
             Path(slot_root) if slot_root is not None else None,
         ) as slot:
@@ -1913,11 +2140,6 @@ def evaluate(
                     )
                 else:
                     result = reversed_result
-            raw_manifest = slot.results_dir / f"runtime_result_{candidate.digest[:16]}.json"
-            raw_manifest.write_text(
-                json.dumps(scrub_secrets(result), sort_keys=True, indent=2) + "\n",
-                encoding="utf-8",
-            )
             metrics = score_runtime_result(result)
             metrics["eval_time"] = float(time.monotonic() - started)
             metrics["candidate_digest"] = candidate.digest[:16]
@@ -1928,9 +2150,14 @@ def evaluate(
             metrics["control_generated_fingerprint"] = control.generated_fingerprint[:16]
             metrics["candidate_generated_fingerprint"] = enabled.generated_fingerprint[:16]
             metrics = scrub_secrets(metrics)
-            manifest = slot.results_dir / f"evaluation_{candidate.digest[:16]}.json"
-            manifest.write_text(json.dumps(metrics, sort_keys=True, indent=2) + "\n", encoding="utf-8")
-            return metrics
+            try:
+                return _publish_evaluation_attempt(
+                    slot, candidate, enabled, result, metrics
+                )
+            except OSError as exc:
+                raise InfrastructureError(
+                    f"failed to publish immutable evaluation attempt: {exc}"
+                ) from exc
     except CandidateError as exc:
         return _failure(exc, elapsed=time.monotonic() - started)
     except InfrastructureError as exc:

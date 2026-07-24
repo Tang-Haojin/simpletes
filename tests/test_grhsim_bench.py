@@ -58,6 +58,45 @@ def _candidate_text(
     )
 
 
+def test_ablation_materializer_preserves_checkpoint_patch_and_options(
+    tmp_path: Path,
+):
+    source_text = _candidate_text(
+        options={"active_mask_gap_pack_policy": "targeted-direct"}
+    )
+    nodes_path = tmp_path / "nodes.json"
+    output_path = tmp_path / "gen20.txt"
+    nodes_path.write_text(
+        json.dumps([{"id": "node-20", "gen_id": 20, "code": source_text}]),
+        encoding="utf-8",
+    )
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(TASK_ROOT / "materialize_ablation.py"),
+            str(nodes_path),
+            "--gen-id",
+            "20",
+            "--label",
+            "no-cold-hint",
+            "--output",
+            str(output_path),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    source = evaluator.parse_candidate_text(source_text)
+    materialized = evaluator.parse_candidate_file(output_path)
+    report = json.loads(completed.stdout)
+    assert materialized.patch == source.patch
+    assert materialized.enable_options == source.enable_options
+    assert materialized.digest == report["digest"]
+    assert report["node_id"] == "node-20"
+
+
 def test_seed_and_schema_are_valid_and_pinned():
     candidate = evaluator.parse_candidate_file(TASK_ROOT / "init_program.txt")
     schema = json.loads((TASK_ROOT / "candidate.schema.json").read_text(encoding="utf-8"))

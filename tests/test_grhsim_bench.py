@@ -10,6 +10,7 @@ import sys
 from types import SimpleNamespace
 
 import pytest
+from jsonschema import Draft202012Validator
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -41,16 +42,28 @@ index 1111111..2222222 100644
 
 
 def _candidate_text(
-    *, patch: str = VALID_PATCH, options: object | None = None, evidence=None
+    *,
+    patch: str = VALID_PATCH,
+    options: object | None = None,
+    evidence=None,
+    candidate_mode: str = "explicit-options",
 ) -> str:
+    option_value = (
+        options
+        if options is not None
+        else {"final_terminal_pushforward_policy": "strict"}
+    )
+    if isinstance(option_value, dict):
+        option_value = [
+            {"name": name, "value": value} for name, value in option_value.items()
+        ]
     payload = {
-        "schema_version": 1,
+        "schema_version": 2,
+        "candidate_mode": candidate_mode,
         "hypothesis": "Avoid redundant work in the enabled GrhSIM path.",
         "evidence": evidence or ["pdocs/grhsim_opt_thj/TNO0001: absolute count=1"],
         "patch": patch,
-        "enable_options": options
-        if options is not None
-        else {"final_terminal_pushforward_policy": "strict"},
+        "enable_options": option_value,
     }
     return (
         "# EVOLVE-BLOCK-START\n"
@@ -63,7 +76,7 @@ def test_ablation_materializer_preserves_checkpoint_patch_and_options(
     tmp_path: Path,
 ):
     source_text = _candidate_text(
-        options={"active_mask_gap_pack_policy": "targeted-direct"}
+        options={"final_terminal_pushforward_policy": "strict"}
     )
     nodes_path = tmp_path / "nodes.json"
     output_path = tmp_path / "gen20.txt"
@@ -92,6 +105,7 @@ def test_ablation_materializer_preserves_checkpoint_patch_and_options(
     source = evaluator.parse_candidate_text(source_text)
     materialized = evaluator.parse_candidate_file(output_path)
     report = json.loads(completed.stdout)
+    assert materialized.candidate_mode == source.candidate_mode
     assert materialized.patch == source.patch
     assert materialized.enable_options == source.enable_options
     assert materialized.digest == report["digest"]
@@ -101,21 +115,73 @@ def test_ablation_materializer_preserves_checkpoint_patch_and_options(
 def test_seed_and_schema_are_valid_and_pinned():
     candidate = evaluator.parse_candidate_file(TASK_ROOT / "init_program.txt")
     schema = json.loads((TASK_ROOT / "candidate.schema.json").read_text(encoding="utf-8"))
+    seed_payload = evaluator._extract_candidate_payload(
+        (TASK_ROOT / "init_program.txt").read_text(encoding="utf-8")
+    )
 
     assert candidate.is_control
-    assert schema["properties"]["schema_version"]["const"] == 1
+    assert candidate.candidate_mode == "control"
+    assert schema["properties"]["schema_version"]["const"] == 2
+    assert schema["properties"]["candidate_mode"]["enum"] == [
+        "default-path",
+        "explicit-options",
+    ]
+    output_errors = list(
+        Draft202012Validator(schema).iter_errors(json.loads(seed_payload))
+    )
+    assert any(error.validator == "enum" for error in output_errors)
+    validated = subprocess.run(
+        [
+            sys.executable,
+            str(TASK_ROOT / "evaluator.py"),
+            str(TASK_ROOT / "init_program.txt"),
+            "--validate-only",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert validated.returncode == 0, validated.stderr
+    assert json.loads(validated.stdout)["candidate_mode"] == "control"
     option_name_schema = schema["properties"]["enable_options"]["items"]["properties"]["name"]
     assert set(option_name_schema["enum"]) == set(evaluator._ALLOWED_ENABLE_OPTIONS)
-    assert evaluator.PINNED_PARENT_COMMIT.startswith("b90d204")
-    assert evaluator.PINNED_WOLVRIX_COMMIT.startswith("f17e90e")
+    assert evaluator._option_environment(
+        {"commit_exact_event_policy": "targeted-cold-layout"}
+    ) == {
+        "WOLVRIX_XS_GRHSIM_COMMIT_EXACT_EVENT_POLICY": "targeted-cold-layout"
+    }
+    assert evaluator.PINNED_PARENT_COMMIT.startswith("fbe4e1c")
+    assert evaluator.PINNED_WOLVRIX_COMMIT.startswith("8f6ba14")
+
+
+def test_model_output_schema_rejects_control_proposals():
+    schema = json.loads((TASK_ROOT / "candidate.schema.json").read_text(encoding="utf-8"))
+    proposal = json.loads(
+        evaluator._extract_candidate_payload(
+            _candidate_text(
+                patch="", options=[], candidate_mode="control", evidence=["control"]
+            )
+        )
+    )
+
+    errors = list(Draft202012Validator(schema).iter_errors(proposal))
+
+    assert errors
+    assert any(
+        list(error.absolute_path) == ["candidate_mode"] and error.validator == "enum"
+        for error in errors
+    )
 
 
 def test_candidate_parser_accepts_marked_json_and_canonicalizes_evidence():
-    candidate = evaluator.parse_candidate_text(_candidate_text(evidence="one fact"))
+    candidate = evaluator.parse_candidate_text(_candidate_text(evidence=["one fact"]))
 
     assert candidate.evidence == ("one fact",)
     assert candidate.enable_options == {"final_terminal_pushforward_policy": "strict"}
     assert evaluator.validate_patch(candidate.patch) == ("lib/example.cpp",)
+
+    with pytest.raises(evaluator.CandidateError, match="array of strings"):
+        evaluator.parse_candidate_text(_candidate_text(evidence="one fact"))
 
 
 def test_candidate_parser_normalizes_structured_output_option_entries():
@@ -128,6 +194,42 @@ def test_candidate_parser_normalizes_structured_output_option_entries():
     )
 
     assert candidate.enable_options == {"final_terminal_pushforward_policy": "strict"}
+
+
+def test_candidate_parser_accepts_all_v2_modes_and_cross_checks_shapes():
+    control = evaluator.parse_candidate_text(
+        _candidate_text(
+            patch="", options=[], candidate_mode="control", evidence=["control"]
+        )
+    )
+    default_path = evaluator.parse_candidate_text(
+        _candidate_text(options=[], candidate_mode="default-path")
+    )
+    explicit = evaluator.parse_candidate_text(_candidate_text())
+
+    assert control.is_control
+    assert default_path.is_default_path and not default_path.enable_options
+    assert explicit.is_explicit_options and explicit.enable_options
+
+    for text, mode in (
+        (_candidate_text(patch="", options=[], candidate_mode="default-path"), "default-path"),
+        (_candidate_text(options=[], candidate_mode="explicit-options"), "explicit-options"),
+        (_candidate_text(candidate_mode="control"), "control"),
+    ):
+        with pytest.raises(evaluator.CandidateError, match=f"candidate_mode={mode}"):
+            evaluator.parse_candidate_text(text)
+
+    invalid_mode = json.loads(evaluator._extract_candidate_payload(_candidate_text()))
+    invalid_mode["candidate_mode"] = []
+    with pytest.raises(evaluator.CandidateError, match="candidate_mode must be"):
+        evaluator.parse_candidate_text(json.dumps(invalid_mode))
+
+    object_options = json.loads(evaluator._extract_candidate_payload(_candidate_text()))
+    object_options["enable_options"] = {
+        "final_terminal_pushforward_policy": "strict"
+    }
+    with pytest.raises(evaluator.CandidateError, match="name/value array"):
+        evaluator.parse_candidate_text(json.dumps(object_options))
 
 
 def test_sourced_command_output_excludes_env_setup_stderr(tmp_path: Path):
@@ -147,13 +249,13 @@ def test_sourced_command_output_excludes_env_setup_stderr(tmp_path: Path):
     "text, message",
     [
         (
-            '{"schema_version":1,"schema_version":1,"hypothesis":"x",'
-            '"evidence":["x"],"patch":"","enable_options":{}}',
+            '{"schema_version":2,"schema_version":2,"candidate_mode":"control",'
+            '"hypothesis":"x","evidence":["x"],"patch":"","enable_options":[]}',
             "duplicate JSON key",
         ),
         (
             _candidate_text(options={}),
-            "require both a non-empty patch and enable_options",
+            "candidate_mode=explicit-options requires patch/options presence",
         ),
         (
             _candidate_text(options={"bad-option": True}),
@@ -328,6 +430,21 @@ def test_build_variant_appends_evaluator_fixed_assignments_after_candidate(monke
         len(make_command) - len(fixed_tail)
     )
 
+    captured.clear()
+    evaluator._build_variant(
+        repo,
+        name="native-control",
+        options={},
+        results_dir=tmp_path / "results",
+        run_function_gates=False,
+    )
+    native_command = captured[0]
+    assert not any(
+        item.startswith("WOLVRIX_XS_GRHSIM_COMMIT_EXACT_EVENT_POLICY=")
+        or item.startswith("WOLVRIX_XS_GRHSIM_ACTIVE_MASK_GAP_PACK_POLICY=")
+        for item in native_command
+    )
+
 
 def test_prepare_artifacts_rejects_patch_with_only_preexisting_option_effect(
     monkeypatch, tmp_path: Path
@@ -340,6 +457,9 @@ def test_prepare_artifacts_rejects_patch_with_only_preexisting_option_effect(
     candidate_repo.mkdir()
     env_sh = candidate_repo / "env.sh"
     env_sh.write_text("true\n", encoding="utf-8")
+    (control_repo / "env.sh").write_text("true\n", encoding="utf-8")
+    for filename in ("emu", "image", "nemu"):
+        (control_repo / filename).write_bytes(filename.encode())
     results = tmp_path / "results"
     results.mkdir()
     control = evaluator.BuildArtifacts(
@@ -383,7 +503,7 @@ def test_prepare_artifacts_rejects_patch_with_only_preexisting_option_effect(
     monkeypatch.setattr(evaluator, "_emit_only_fingerprint", fake_emit)
 
     def fake_build(_repo, *, name, **_kwargs):
-        events.append(name.rsplit("_", 1)[-1])
+        events.append("disabled" if name.endswith("_disabled") else "candidate-build")
         fingerprint = "default" if name.endswith("_disabled") else "option"
         return evaluator.BuildArtifacts(
             name=name,
@@ -409,9 +529,158 @@ def test_prepare_artifacts_rejects_patch_with_only_preexisting_option_effect(
         "patch",
         "disabled",
         "after the default-off candidate build",
-        "enabled",
+        "candidate-build",
         "after the enabled candidate build",
     ]
+
+
+def test_prepare_artifacts_default_path_uses_native_options_and_skips_option_attribution(
+    monkeypatch, tmp_path: Path
+):
+    events: list[str] = []
+    candidate = evaluator.parse_candidate_text(
+        _candidate_text(options=[], candidate_mode="default-path")
+    )
+    control_repo = tmp_path / "control"
+    candidate_repo = tmp_path / "candidate"
+    control_repo.mkdir()
+    candidate_repo.mkdir()
+    env_sh = candidate_repo / "env.sh"
+    env_sh.write_text("true\n", encoding="utf-8")
+    (control_repo / "env.sh").write_text("true\n", encoding="utf-8")
+    for filename in ("emu", "image", "nemu"):
+        (control_repo / filename).write_bytes(filename.encode())
+    results = tmp_path / "results"
+    results.mkdir()
+    control = evaluator.BuildArtifacts(
+        name="control",
+        repo=control_repo,
+        binary=control_repo / "emu",
+        image=control_repo / "image",
+        nemu=control_repo / "nemu",
+        generated_fingerprint="control-generated",
+        build_config_fingerprint="fixed",
+        toolchain_fingerprint="toolchain",
+    )
+    slot = evaluator.Slot(tmp_path, control_repo, candidate_repo, results, None)
+
+    monkeypatch.setattr(evaluator, "_control_artifacts", lambda _slot: control)
+    monkeypatch.setattr(
+        evaluator,
+        "_prepare_candidate_clone",
+        lambda *_args, **_kwargs: (events.append("clone") or env_sh),
+    )
+    monkeypatch.setattr(
+        evaluator,
+        "_stage_control_generation_inputs",
+        lambda *_args, **_kwargs: (events.append("stage") or "fixed-inputs"),
+    )
+    monkeypatch.setattr(
+        evaluator,
+        "_verify_generation_inputs_unchanged",
+        lambda _repo, expected, *, phase: events.append(phase),
+    )
+    monkeypatch.setattr(
+        evaluator,
+        "_apply_candidate_patch",
+        lambda *_args: events.append("patch"),
+    )
+    monkeypatch.setattr(
+        evaluator,
+        "_emit_only_fingerprint",
+        lambda *_args, **_kwargs: pytest.fail("default-path emitted unpatched options"),
+    )
+    monkeypatch.setattr(
+        evaluator,
+        "_build_config_fingerprint",
+        lambda _options, *, jobs: "fixed",
+    )
+
+    def fake_build(_repo, *, name, options, **_kwargs):
+        assert name == evaluator._candidate_artifact_name(candidate)
+        assert options == {}
+        events.append("native-build")
+        return evaluator.BuildArtifacts(
+            name=name,
+            repo=candidate_repo,
+            binary=candidate_repo / "emu",
+            image=candidate_repo / "image",
+            nemu=candidate_repo / "nemu",
+            generated_fingerprint="candidate-generated",
+            build_config_fingerprint="fixed",
+            toolchain_fingerprint="toolchain",
+        )
+
+    monkeypatch.setattr(evaluator, "_build_variant", fake_build)
+    monkeypatch.setattr(
+        evaluator,
+        "_write_candidate_proof",
+        lambda _candidate, _slot, _control, enabled, **_kwargs: enabled,
+    )
+
+    returned_control, returned = evaluator._prepare_artifacts(candidate, slot)
+
+    assert returned_control is control
+    assert returned.generated_fingerprint == "candidate-generated"
+    assert events == [
+        "clone",
+        "stage",
+        "patch",
+        "native-build",
+        "after the enabled candidate build",
+    ]
+
+
+def test_prepare_artifacts_default_path_requires_generated_difference(
+    monkeypatch, tmp_path: Path
+):
+    candidate = evaluator.parse_candidate_text(
+        _candidate_text(options=[], candidate_mode="default-path")
+    )
+    control_repo = tmp_path / "control"
+    candidate_repo = tmp_path / "candidate"
+    control_repo.mkdir()
+    candidate_repo.mkdir()
+    env_sh = candidate_repo / "env.sh"
+    env_sh.write_text("true\n", encoding="utf-8")
+    (control_repo / "env.sh").write_text("true\n", encoding="utf-8")
+    for filename in ("emu", "image", "nemu"):
+        (control_repo / filename).write_bytes(filename.encode())
+    results = tmp_path / "results"
+    results.mkdir()
+    control = evaluator.BuildArtifacts(
+        name="control",
+        repo=control_repo,
+        binary=control_repo / "emu",
+        image=control_repo / "image",
+        nemu=control_repo / "nemu",
+        generated_fingerprint="same",
+        build_config_fingerprint="fixed",
+        toolchain_fingerprint="toolchain",
+    )
+    slot = evaluator.Slot(tmp_path, control_repo, candidate_repo, results, None)
+    monkeypatch.setattr(evaluator, "_control_artifacts", lambda _slot: control)
+    monkeypatch.setattr(evaluator, "_prepare_candidate_clone", lambda *_args: env_sh)
+    monkeypatch.setattr(evaluator, "_stage_control_generation_inputs", lambda *_args: "inputs")
+    monkeypatch.setattr(evaluator, "_verify_generation_inputs_unchanged", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(evaluator, "_apply_candidate_patch", lambda *_args: None)
+    monkeypatch.setattr(
+        evaluator,
+        "_build_variant",
+        lambda *_args, **kwargs: evaluator.BuildArtifacts(
+            name=kwargs["name"],
+            repo=candidate_repo,
+            binary=candidate_repo / "emu",
+            image=candidate_repo / "image",
+            nemu=candidate_repo / "nemu",
+            generated_fingerprint="same",
+            build_config_fingerprint="fixed",
+            toolchain_fingerprint="toolchain",
+        ),
+    )
+
+    with pytest.raises(evaluator.CandidateError, match="native default-path patch"):
+        evaluator._prepare_artifacts(candidate, slot)
 
 
 def test_control_cache_rebuilds_when_artifact_sha_changes(monkeypatch, tmp_path: Path):
@@ -677,8 +946,9 @@ def _publish_retry_attempt(proof, *, error="quiet CCD"):
         "retryable_infra": 1.0,
         "retry_after_s": 30.0,
         "error": error,
+        "candidate_mode": proof.candidate.candidate_mode,
         "candidate_files": 1,
-        "enable_option_count": 1,
+        "enable_option_count": len(proof.candidate.enable_options),
         "parent_commit": proof.ev.PINNED_PARENT_COMMIT[:12],
         "wolvrix_commit": proof.ev.PINNED_WOLVRIX_COMMIT[:12],
         "control_generated_fingerprint": proof.control.generated_fingerprint[:16],
@@ -707,10 +977,19 @@ def _rewrite_attempt_document(proof, name: str, update):
     proof.ev._atomic_write_json(proof.complete_path, complete)
 
 
-def _runtime_retry_proof(monkeypatch, tmp_path: Path):
+def _runtime_retry_proof(
+    monkeypatch, tmp_path: Path, *, candidate_mode: str = "explicit-options"
+):
     ev = retry_runtime.evaluator
     candidate = ev.parse_candidate_text(
-        _candidate_text(options={"active_mask_gap_pack_policy": "targeted-direct"})
+        _candidate_text(
+            options=(
+                {"final_terminal_pushforward_policy": "strict"}
+                if candidate_mode == "explicit-options"
+                else []
+            ),
+            candidate_mode=candidate_mode,
+        )
     )
     slot_root = tmp_path / "slot-0"
     control_repo = slot_root / "control"
@@ -738,7 +1017,9 @@ def _runtime_retry_proof(monkeypatch, tmp_path: Path):
     control_generated = "c" * 64
     candidate_generated = "d" * 64
     monkeypatch.setattr(ev, "_verify_pinned_repo", lambda *_args: None)
-    monkeypatch.setattr(ev, "_artifact_paths", lambda repo: artifacts_by_repo[repo])
+    monkeypatch.setattr(
+        ev, "_artifact_paths", lambda repo, **_kwargs: artifacts_by_repo[repo]
+    )
     monkeypatch.setattr(
         ev,
         "generated_fingerprint",
@@ -794,18 +1075,26 @@ def _runtime_retry_proof(monkeypatch, tmp_path: Path):
     patch_path = slot_root / "candidate.patch"
     patch_path.write_text(candidate.patch, encoding="utf-8")
     candidate_binary, candidate_image, candidate_nemu = artifacts_by_repo[candidate_repo]
+    candidate_build_config = "b" * 64 if candidate.enable_options else "a" * 64
     enabled = ev.BuildArtifacts(
-        name=f"candidate_{candidate.digest[:12]}_enabled",
+        name=ev._candidate_artifact_name(candidate),
         repo=candidate_repo,
         binary=candidate_binary,
         image=candidate_image,
         nemu=candidate_nemu,
         generated_fingerprint=candidate_generated,
-        build_log=results / f"candidate_{candidate.digest[:12]}_enabled_build.log",
-        build_config_fingerprint="b" * 64,
+        build_log=results / f"{ev._candidate_artifact_name(candidate)}_build.log",
+        build_config_fingerprint=candidate_build_config,
         toolchain_fingerprint="e" * 64,
     )
-    enabled = ev._write_candidate_proof(candidate, slot, control, enabled)
+    enabled = ev._write_candidate_proof(
+        candidate,
+        slot,
+        control,
+        enabled,
+        control_artifact_sha256=ev._artifact_sha256(control),
+        control_env_sha256=ev._sha256_file(control_repo / "env.sh"),
+    )
     proof = SimpleNamespace(
         ev=ev,
         candidate=candidate,
@@ -835,18 +1124,88 @@ def test_runtime_only_retry_reuses_complete_proof_without_building(
     )
 
     assert control.name == "control"
-    assert candidate.name == f"candidate_{proof.candidate.digest[:12]}_enabled"
+    assert candidate.name == proof.ev._candidate_artifact_name(proof.candidate)
     assert candidate.generated_fingerprint == "d" * 64
     marker = json.loads(proof.proof_path.read_text(encoding="utf-8"))
     assert set(marker) == retry_runtime._CANDIDATE_PROOF_FIELDS
     assert marker["schema_version"] == proof.ev.CANDIDATE_PROOF_SCHEMA_VERSION
     assert marker["proof_version"] == proof.ev.CANDIDATE_PROOF_VERSION
     assert marker["candidate_digest"] == proof.candidate.digest
+    assert marker["candidate_mode"] == proof.candidate.candidate_mode
     assert marker["artifacts"]["binary"]["sha256"] == proof.ev._sha256_file(
         proof.candidate_binary
     )
     assert marker["env_sh"]["candidate_sha256"] == marker["env_sh"]["control_sha256"]
     assert candidate.candidate_proof_sha256 == proof.ev._sha256_file(proof.proof_path)
+
+
+def test_runtime_only_retry_reuses_default_path_proof(monkeypatch, tmp_path: Path):
+    proof = _runtime_retry_proof(
+        monkeypatch, tmp_path, candidate_mode="default-path"
+    )
+
+    control, candidate = retry_runtime.prepare_reused_artifacts(
+        proof.candidate, proof.slot
+    )
+
+    assert control.name == "control"
+    assert candidate.name == proof.ev._candidate_artifact_name(proof.candidate)
+    assert proof.candidate.candidate_mode == "default-path"
+    assert candidate.build_config_fingerprint == control.build_config_fingerprint
+
+
+@pytest.mark.parametrize(
+    ("artifact_name", "message"),
+    (("image", "image SHA-256 differ"), ("nemu", "NEMU SHA-256 differ")),
+)
+def test_full_candidate_proof_rejects_workload_or_reference_drift_before_publish(
+    monkeypatch, tmp_path: Path, artifact_name: str, message: str
+):
+    proof = _runtime_retry_proof(monkeypatch, tmp_path)
+    control_sha256 = proof.ev._artifact_sha256(proof.control)
+    control_env_sha256 = proof.ev._sha256_file(proof.control_repo / "env.sh")
+    proof.proof_path.unlink()
+    getattr(proof.enabled, artifact_name).write_bytes(b"candidate-owned-drift")
+
+    with pytest.raises(proof.ev.CandidateError, match=message):
+        proof.ev._write_candidate_proof(
+            proof.candidate,
+            proof.slot,
+            proof.control,
+            proof.enabled,
+            control_artifact_sha256=control_sha256,
+            control_env_sha256=control_env_sha256,
+        )
+
+    assert not proof.proof_path.exists()
+
+
+def test_full_candidate_proof_rejects_coordinated_control_marker_mutation(
+    monkeypatch, tmp_path: Path
+):
+    proof = _runtime_retry_proof(monkeypatch, tmp_path)
+    control_sha256 = proof.ev._artifact_sha256(proof.control)
+    control_env_sha256 = proof.ev._sha256_file(proof.control_repo / "env.sh")
+    proof.proof_path.unlink()
+    proof.control_binary.write_bytes(b"coordinated-control-mutation")
+    marker_path = proof.slot.results_dir / "control_artifacts.json"
+    marker = json.loads(marker_path.read_text(encoding="utf-8"))
+    marker["artifact_sha256"]["binary"] = proof.ev._sha256_file(
+        proof.control_binary
+    )
+    proof.ev._atomic_write_json(marker_path, marker)
+
+    with pytest.raises(proof.ev.InfrastructureError, match="changed during"):
+        proof.ev._write_candidate_proof(
+            proof.candidate,
+            proof.slot,
+            proof.control,
+            proof.enabled,
+            control_artifact_sha256=control_sha256,
+            control_env_sha256=control_env_sha256,
+        )
+
+    assert not proof.proof_path.exists()
 
 
 def test_runtime_only_retry_rejects_digest_patch_and_fingerprint_mismatches(
@@ -871,6 +1230,26 @@ def test_runtime_only_retry_rejects_digest_patch_and_fingerprint_mismatches(
     with pytest.raises(proof.ev.InfrastructureError, match="proof binding differs"):
         retry_runtime.prepare_reused_artifacts(proof.candidate, proof.slot)
 
+    proof = _runtime_retry_proof(monkeypatch, tmp_path / "mode")
+    marker = json.loads(proof.proof_path.read_text(encoding="utf-8"))
+    marker["candidate_mode"] = "default-path"
+    proof.ev._atomic_write_json(proof.proof_path, marker)
+    with pytest.raises(proof.ev.InfrastructureError, match="candidate_mode"):
+        retry_runtime.prepare_reused_artifacts(proof.candidate, proof.slot)
+
+
+def test_runtime_only_retry_binds_candidate_mode_in_attempt_documents(
+    monkeypatch, tmp_path: Path
+):
+    proof = _runtime_retry_proof(monkeypatch, tmp_path)
+    _rewrite_attempt_document(
+        proof,
+        "evaluation.json",
+        lambda value: value.__setitem__("candidate_mode", "default-path"),
+    )
+    with pytest.raises(proof.ev.InfrastructureError, match="candidate_mode"):
+        retry_runtime.prepare_reused_artifacts(proof.candidate, proof.slot)
+
 
 def test_runtime_only_retry_rejects_pinned_control_sha_and_input_failures(
     monkeypatch, tmp_path: Path
@@ -892,6 +1271,22 @@ def test_runtime_only_retry_rejects_pinned_control_sha_and_input_failures(
     proof = _runtime_retry_proof(monkeypatch, tmp_path / "inputs")
     proof.candidate_image.write_bytes(b"different-image")
     with pytest.raises(proof.ev.InfrastructureError, match="image SHA-256 differs"):
+        retry_runtime.prepare_reused_artifacts(proof.candidate, proof.slot)
+
+
+def test_runtime_only_retry_rejects_coordinated_control_and_marker_replacement(
+    monkeypatch, tmp_path: Path
+):
+    proof = _runtime_retry_proof(monkeypatch, tmp_path)
+    proof.control_binary.write_bytes(b"replacement-control-binary")
+    marker_path = proof.slot.results_dir / "control_artifacts.json"
+    marker = json.loads(marker_path.read_text(encoding="utf-8"))
+    marker["artifact_sha256"]["binary"] = proof.ev._sha256_file(
+        proof.control_binary
+    )
+    proof.ev._atomic_write_json(marker_path, marker)
+
+    with pytest.raises(proof.ev.InfrastructureError, match="control_identity"):
         retry_runtime.prepare_reused_artifacts(proof.candidate, proof.slot)
 
 
@@ -1036,11 +1431,12 @@ def test_attempt_publish_requires_proof_for_noncontrol_and_uses_control_sentinel
     control_candidate = proof.ev.parse_candidate_text(
         json.dumps(
             {
-                "schema_version": 1,
+                "schema_version": 2,
+                "candidate_mode": "control",
                 "hypothesis": "control",
                 "evidence": ["control"],
                 "patch": "",
-                "enable_options": {},
+                "enable_options": [],
             }
         )
     )
@@ -1294,6 +1690,31 @@ def test_candidate_build_failure_is_not_retryable(monkeypatch, tmp_path: Path):
     assert "candidate compile failed" in metrics["error"]
 
 
+def _write_v2_checkpoint_seed(path: Path, *, pin_override=None) -> str:
+    text = _candidate_text()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+    parent_pin, wolvrix_pin = pin_override or (
+        evaluator.PINNED_PARENT_COMMIT[:12],
+        evaluator.PINNED_WOLVRIX_COMMIT[:12],
+    )
+    (path.parent / "nodes.json").write_text(
+        json.dumps(
+            [
+                {
+                    "code": text,
+                    "metrics": {
+                        "parent_commit": parent_pin,
+                        "wolvrix_commit": wolvrix_pin,
+                    },
+                }
+            ]
+        ),
+        encoding="utf-8",
+    )
+    return text
+
+
 def test_launcher_uses_fixed_model_serial_budget_and_only_secret_file_paths(
     monkeypatch, tmp_path: Path
 ):
@@ -1350,8 +1771,7 @@ def test_launcher_uses_explicit_best_program_as_initial_seed(tmp_path: Path):
     config.write_text("model_provider = 'mjy'\n", encoding="utf-8")
     auth.write_text('{}\n', encoding="utf-8")
     best_program = tmp_path / "previous" / "db_state_161238" / "best_program.txt"
-    best_program.parent.mkdir(parents=True)
-    best_program.write_text(_candidate_text(), encoding="utf-8")
+    _write_v2_checkpoint_seed(best_program)
     args = SimpleNamespace(
         target_repo=target,
         codex_config=config,
@@ -1439,6 +1859,131 @@ def test_launcher_rejects_symlinked_explicit_initial_seed(tmp_path: Path):
 
     with pytest.raises(SystemExit, match="initial program must not be a symbolic link"):
         launcher.build_command(args)
+
+
+def test_launcher_rejects_legacy_seed_and_wrong_pin_checkpoint(tmp_path: Path):
+    target = tmp_path / "target"
+    (target / ".git").mkdir(parents=True)
+    (target / "env.sh").write_text("true\n", encoding="utf-8")
+    config = tmp_path / "config.mjy.toml"
+    auth = tmp_path / "auth.mjy.json"
+    config.write_text("model_provider = 'mjy'\n", encoding="utf-8")
+    auth.write_text("{}\n", encoding="utf-8")
+    legacy = tmp_path / "legacy.txt"
+    legacy.write_text(
+        _candidate_text().replace('"schema_version": 2', '"schema_version": 1'),
+        encoding="utf-8",
+    )
+    args = SimpleNamespace(
+        target_repo=target,
+        codex_config=config,
+        codex_auth=auth,
+        init_program=legacy,
+        output_path=tmp_path / "checkpoints",
+        slot_root=tmp_path / "slots",
+        resume=None,
+        max_proposals=16,
+        valid_target=8,
+        eval_timeout=21_600.0,
+        llm_timeout=3_000.0,
+        max_tokens=32_768,
+    )
+    with pytest.raises(SystemExit, match="schema v2"):
+        launcher.build_command(args)
+
+    wrong_pin = tmp_path / "old" / "db_state_010203" / "best_program.txt"
+    _write_v2_checkpoint_seed(wrong_pin, pin_override=("a" * 12, "b" * 12))
+    args.init_program = wrong_pin
+    with pytest.raises(SystemExit, match="evaluator pins differ"):
+        launcher.build_command(args)
+
+
+def test_launcher_rejects_legacy_or_wrong_pin_resume(tmp_path: Path):
+    target = tmp_path / "target"
+    (target / ".git").mkdir(parents=True)
+    (target / "env.sh").write_text("true\n", encoding="utf-8")
+    config = tmp_path / "config.mjy.toml"
+    auth = tmp_path / "auth.mjy.json"
+    config.write_text("model_provider = 'mjy'\n", encoding="utf-8")
+    auth.write_text("{}\n", encoding="utf-8")
+    state = tmp_path / "instance" / "db_state_010203"
+    best = state / "best_program.txt"
+    _write_v2_checkpoint_seed(best, pin_override=("a" * 12, "b" * 12))
+    args = SimpleNamespace(
+        target_repo=target,
+        codex_config=config,
+        codex_auth=auth,
+        init_program=launcher.DEFAULT_INIT_PROGRAM,
+        output_path=tmp_path / "checkpoints",
+        slot_root=tmp_path / "slots",
+        resume=state.parent,
+        max_proposals=16,
+        valid_target=8,
+        eval_timeout=21_600.0,
+        llm_timeout=3_000.0,
+        max_tokens=32_768,
+    )
+    with pytest.raises(SystemExit, match="evaluator pins differ"):
+        launcher.build_command(args)
+
+    _write_v2_checkpoint_seed(best)
+    best.write_text(
+        best.read_text(encoding="utf-8").replace(
+            '"schema_version": 2', '"schema_version": 1'
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(SystemExit, match="schema v2"):
+        launcher.build_command(args)
+
+
+def test_launcher_resume_uses_the_exact_validated_state_and_seed(
+    monkeypatch, tmp_path: Path
+):
+    target = tmp_path / "target"
+    (target / ".git").mkdir(parents=True)
+    (target / "env.sh").write_text("true\n", encoding="utf-8")
+    config = tmp_path / "config.mjy.toml"
+    auth = tmp_path / "auth.mjy.json"
+    config.write_text("model_provider = 'mjy'\n", encoding="utf-8")
+    auth.write_text("{}\n", encoding="utf-8")
+    instance = tmp_path / "instance"
+    selected_state = instance / "db_state_010203"
+    selected_seed = selected_state / "best_program.txt"
+    _write_v2_checkpoint_seed(selected_seed)
+    args = SimpleNamespace(
+        target_repo=target,
+        codex_config=config,
+        codex_auth=auth,
+        init_program=launcher.DEFAULT_INIT_PROGRAM,
+        output_path=tmp_path / "checkpoints",
+        slot_root=tmp_path / "slots",
+        resume=instance,
+        max_proposals=16,
+        valid_target=8,
+        eval_timeout=21_600.0,
+        llm_timeout=3_000.0,
+        max_tokens=32_768,
+    )
+    original_validate = launcher._validate_checkpoint_contract
+
+    def validate_then_publish_newer(*validate_args, **validate_kwargs):
+        validated = original_validate(*validate_args, **validate_kwargs)
+        newer_seed = instance / "db_state_999999" / "best_program.txt"
+        _write_v2_checkpoint_seed(newer_seed)
+        return validated
+
+    monkeypatch.setattr(
+        launcher, "_validate_checkpoint_contract", validate_then_publish_newer
+    )
+
+    command, _environment = launcher.build_command(args)
+    resume_index = command.index("--resume")
+    init_index = command.index("--init-program")
+
+    assert command[resume_index + 1] == str(selected_state.resolve())
+    assert command[init_index + 1] == str(selected_seed.resolve())
+    assert command[resume_index + 1] != str(instance.resolve())
 
 
 def test_launcher_cli_defaults_to_dataset_initial_program(monkeypatch, capsys):

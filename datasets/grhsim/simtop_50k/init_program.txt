@@ -1,11 +1,12 @@
 # EVOLVE-BLOCK-START
 {
-  "schema_version": 1,
+  "schema_version": 2,
+  "candidate_mode": "control",
   "hypothesis": "Pinned current-default control with no source modification.",
   "evidence": [
-    "This seed establishes the score=1 control at parent b90d204 and wolvrix f17e90e."
+    "This seed establishes the native-default control baseline at parent fbe4e1c and wolvrix 8f6ba14."
   ],
   "patch": "",
-  "enable_options": {}
+  "enable_options": []
 }
 # EVOLVE-BLOCK-END

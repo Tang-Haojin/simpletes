@@ -55,10 +55,12 @@ _CANDIDATE_PROOF_FIELDS = {
     "proof_id",
     "created_time_ns",
     "candidate_digest",
+    "candidate_mode",
     "patch_sha256",
     "canonical_enable_options",
     "parent_commit",
     "wolvrix_commit",
+    "control_identity",
     "repo",
     "generated_fingerprint",
     "build_config_fingerprint",
@@ -71,6 +73,7 @@ _ATTEMPT_COMPLETE_FIELDS = {
     "attempt_id",
     "created_time_ns",
     "candidate_digest",
+    "candidate_mode",
     "candidate_proof_id",
     "candidate_proof_sha256",
     "runtime_result_sha256",
@@ -100,14 +103,6 @@ def _require_regular_nonempty(path: Path, label: str) -> None:
         raise evaluator.InfrastructureError(f"{label} is empty: {path}")
 
 
-def _artifact_sha256(artifacts: Any) -> dict[str, str]:
-    return {
-        "binary": evaluator._sha256_file(artifacts.binary),
-        "image": evaluator._sha256_file(artifacts.image),
-        "nemu": evaluator._sha256_file(artifacts.nemu),
-    }
-
-
 def _require_exact_fields(value: Mapping[str, Any], expected: set[str], label: str) -> None:
     actual = set(value)
     if actual != expected:
@@ -127,67 +122,9 @@ def _is_float(value: Any) -> bool:
 
 def _load_verified_control_artifacts(slot: Any) -> Any:
     """Load the cached control or fail; unlike evaluator, never rebuild it."""
-
-    marker_path = slot.results_dir / "control_artifacts.json"
-    raw = _read_json_object(marker_path, "control artifact marker")
-    env_sh = slot.control_repo / "env.sh"
-    _require_regular_nonempty(env_sh, "control env.sh")
-    evaluator._verify_pinned_repo(slot.control_repo, env_sh)
-
-    try:
-        artifacts = evaluator.BuildArtifacts(
-            name=str(raw["name"]),
-            repo=Path(raw["repo"]),
-            binary=Path(raw["binary"]),
-            image=Path(raw["image"]),
-            nemu=Path(raw["nemu"]),
-            generated_fingerprint=str(raw["generated_fingerprint"]),
-            build_log=Path(raw["build_log"]) if raw.get("build_log") else None,
-            build_config_fingerprint=str(raw["build_config_fingerprint"]),
-            toolchain_fingerprint=str(raw["toolchain_fingerprint"]),
-        )
-    except (KeyError, TypeError, ValueError) as error:
-        raise evaluator.InfrastructureError(
-            f"malformed control artifact marker: {error}"
-        ) from error
-
-    binary, image, nemu = evaluator._artifact_paths(slot.control_repo)
-    jobs = max(1, int(os.environ.get("GRHSIM_BUILD_JOBS", "4")))
-    expected_build = evaluator._build_config_fingerprint({}, jobs=jobs)
-    expected_toolchain = evaluator._toolchain_fingerprint(slot.control_repo, env_sh)
-    expected_sha256 = _artifact_sha256(
-        evaluator.BuildArtifacts(
-            name="control",
-            repo=slot.control_repo,
-            binary=binary,
-            image=image,
-            nemu=nemu,
-            generated_fingerprint=artifacts.generated_fingerprint,
-        )
+    artifacts, _artifact_sha256_by_name = evaluator._verify_control_artifact_identity(
+        slot
     )
-    checks = {
-        "schema_version": _is_int(raw.get("schema_version"))
-        and raw.get("schema_version") == evaluator.CONTROL_MARKER_SCHEMA_VERSION,
-        "name": type(raw.get("name")) is str and artifacts.name == "control",
-        "repo": type(raw.get("repo")) is str and artifacts.repo == slot.control_repo,
-        "parent_commit": type(raw.get("parent_commit")) is str
-        and raw.get("parent_commit") == evaluator.PINNED_PARENT_COMMIT,
-        "wolvrix_commit": type(raw.get("wolvrix_commit")) is str
-        and raw.get("wolvrix_commit") == evaluator.PINNED_WOLVRIX_COMMIT,
-        "binary_path": artifacts.binary == binary,
-        "image_path": artifacts.image == image,
-        "nemu_path": artifacts.nemu == nemu,
-        "generated_fingerprint": evaluator.generated_fingerprint(slot.control_repo)
-        == artifacts.generated_fingerprint,
-        "build_config_fingerprint": artifacts.build_config_fingerprint == expected_build,
-        "toolchain_fingerprint": artifacts.toolchain_fingerprint == expected_toolchain,
-        "artifact_sha256": raw.get("artifact_sha256") == expected_sha256,
-    }
-    failed = sorted(name for name, passed in checks.items() if not passed)
-    if failed:
-        raise evaluator.InfrastructureError(
-            "cached control failed runtime-only proof: " + ", ".join(failed)
-        )
     return artifacts
 
 
@@ -218,6 +155,8 @@ def _load_candidate_proof(candidate: Any, slot: Any, control: Any) -> tuple[Any,
         "proof_version": _is_int(raw.get("proof_version")),
         "candidate_digest": type(raw.get("candidate_digest")) is str
         and bool(_HEX_64_RE.fullmatch(raw.get("candidate_digest", ""))),
+        "candidate_mode": type(raw.get("candidate_mode")) is str
+        and raw.get("candidate_mode") in {"default-path", "explicit-options"},
         "patch_sha256": type(raw.get("patch_sha256")) is str
         and bool(_HEX_64_RE.fullmatch(raw.get("patch_sha256", ""))),
         "canonical_enable_options": type(raw.get("canonical_enable_options")) is str,
@@ -235,6 +174,39 @@ def _load_candidate_proof(candidate: Any, slot: Any, control: Any) -> tuple[Any,
     if malformed:
         raise evaluator.InfrastructureError(
             "candidate artifact proof has malformed fields: " + ", ".join(malformed)
+        )
+
+    control_identity = raw.get("control_identity")
+    control_identity_fields = {
+        "generated_fingerprint",
+        "build_config_fingerprint",
+        "toolchain_fingerprint",
+        "artifact_sha256",
+    }
+    if not isinstance(control_identity, dict) or set(control_identity) != control_identity_fields:
+        raise evaluator.InfrastructureError(
+            "candidate artifact proof has malformed control_identity"
+        )
+    control_artifact_sha256 = control_identity.get("artifact_sha256")
+    if (
+        not isinstance(control_artifact_sha256, dict)
+        or set(control_artifact_sha256) != {"binary", "image", "nemu"}
+        or any(
+            type(value) is not str or not _HEX_64_RE.fullmatch(value)
+            for value in control_artifact_sha256.values()
+        )
+        or any(
+            type(control_identity.get(name)) is not str
+            or not _HEX_64_RE.fullmatch(control_identity.get(name, ""))
+            for name in (
+                "generated_fingerprint",
+                "build_config_fingerprint",
+                "toolchain_fingerprint",
+            )
+        )
+    ):
+        raise evaluator.InfrastructureError(
+            "candidate artifact proof has malformed control_identity"
         )
 
     candidate_env = slot.candidate_repo / "env.sh"
@@ -290,12 +262,19 @@ def _load_candidate_proof(candidate: Any, slot: Any, control: Any) -> tuple[Any,
         "schema_version": evaluator.CANDIDATE_PROOF_SCHEMA_VERSION,
         "proof_version": evaluator.CANDIDATE_PROOF_VERSION,
         "candidate_digest": candidate.digest,
+        "candidate_mode": candidate.candidate_mode,
         "patch_sha256": hashlib.sha256(candidate.patch.encode("utf-8")).hexdigest(),
         "canonical_enable_options": evaluator._canonical_enable_options(
             candidate.enable_options
         ),
         "parent_commit": evaluator.PINNED_PARENT_COMMIT,
         "wolvrix_commit": evaluator.PINNED_WOLVRIX_COMMIT,
+        "control_identity": {
+            "generated_fingerprint": control.generated_fingerprint,
+            "build_config_fingerprint": control.build_config_fingerprint,
+            "toolchain_fingerprint": control.toolchain_fingerprint,
+            "artifact_sha256": evaluator._artifact_sha256(control),
+        },
         "repo": str(slot.candidate_repo.resolve()),
         "generated_fingerprint": generated,
         "build_config_fingerprint": build_config,
@@ -317,14 +296,19 @@ def _load_candidate_proof(candidate: Any, slot: Any, control: Any) -> tuple[Any,
         raise evaluator.InfrastructureError("candidate and control NEMU artifacts differ")
     if toolchain != control.toolchain_fingerprint:
         raise evaluator.InfrastructureError("candidate and control toolchains differ")
+    if generated == control.generated_fingerprint:
+        raise evaluator.InfrastructureError(
+            "candidate generated fingerprint is identical to control"
+        )
     enabled = evaluator.BuildArtifacts(
-        name=f"candidate_{candidate.digest[:12]}_enabled",
+        name=evaluator._candidate_artifact_name(candidate),
         repo=slot.candidate_repo,
         binary=binary,
         image=image,
         nemu=nemu,
         generated_fingerprint=generated,
-        build_log=slot.results_dir / f"candidate_{candidate.digest[:12]}_enabled_build.log",
+        build_log=slot.results_dir
+        / f"{evaluator._candidate_artifact_name(candidate)}_build.log",
         build_config_fingerprint=build_config,
         toolchain_fingerprint=toolchain,
         candidate_proof_id=proof_id,
@@ -348,6 +332,8 @@ def _validate_attempt_document_identity(
         and value.get("candidate_digest") == candidate.digest[:16],
         "candidate_digest_full": type(value.get("candidate_digest_full")) is str
         and value.get("candidate_digest_full") == candidate.digest,
+        "candidate_mode": type(value.get("candidate_mode")) is str
+        and value.get("candidate_mode") == candidate.candidate_mode,
         "candidate_proof_id": type(value.get("candidate_proof_id")) is str
         and value.get("candidate_proof_id") == proof_id,
         "candidate_proof_sha256": type(value.get("candidate_proof_sha256")) is str
@@ -395,6 +381,8 @@ def _load_latest_complete_attempt(
             "created_time_ns": _is_int(created_time_ns) and created_time_ns > 0,
             "candidate_digest": type(complete.get("candidate_digest")) is str
             and complete.get("candidate_digest") == candidate.digest,
+            "candidate_mode": type(complete.get("candidate_mode")) is str
+            and complete.get("candidate_mode") == candidate.candidate_mode,
             "candidate_proof_id": type(complete.get("candidate_proof_id")) is str,
             "candidate_proof_sha256": type(complete.get("candidate_proof_sha256"))
             is str
@@ -465,6 +453,8 @@ def _load_latest_complete_attempt(
         and prior.get("candidate_files") == expected_files,
         "enable_option_count": type(prior.get("enable_option_count")) is int
         and prior.get("enable_option_count") == len(candidate.enable_options),
+        "candidate_mode": type(prior.get("candidate_mode")) is str
+        and prior.get("candidate_mode") == candidate.candidate_mode,
         "parent_commit": type(prior.get("parent_commit")) is str
         and prior.get("parent_commit") == evaluator.PINNED_PARENT_COMMIT[:12],
         "wolvrix_commit": type(prior.get("wolvrix_commit")) is str

@@ -1,9 +1,10 @@
 """Repository-level evaluator for GrhSIM SimTop 50k optimization.
 
-The evolved program is a JSON document containing a unified diff.  This module
-validates that document, applies the diff to an evaluator-owned clone pinned to
-the benchmark revision, builds current-default and explicitly-enabled variants,
-and delegates only the machine-sensitive runtime protocol to :mod:`runtime`.
+The evolved program is a versioned JSON document containing a unified diff and
+an explicit attribution mode.  This module validates that document, applies the
+diff to an evaluator-owned clone pinned to the benchmark revision, builds the
+mode-appropriate current-default or explicitly-enabled variant, and delegates
+only the machine-sensitive runtime protocol to :mod:`runtime`.
 
 The user's checkout is a read-only source of Git objects and untracked
 ``env.sh`` configuration.  It is never reset, cleaned, patched, or built by this
@@ -38,9 +39,9 @@ SIMPLETES_ROOT = TASK_ROOT.parents[2]
 DEFAULT_SOURCE_REPO = SIMPLETES_ROOT.parent / "wolvrix-playground-gsim-calibrate-5"
 DEFAULT_SLOT_ROOT = Path("/tmp/simpletes-grhsim-simtop-50k")
 
-PINNED_PARENT_COMMIT = "b90d20461d276def682f19a28be1fe65a4387eef"
-PINNED_WOLVRIX_COMMIT = "f17e90e14c3ad70a3ee93f7c6540e13dae54940a"
-SCHEMA_VERSION = 1
+PINNED_PARENT_COMMIT = "fbe4e1cbbfcf45b52960545377020cb761c3ab25"
+PINNED_WOLVRIX_COMMIT = "8f6ba14397b0c3d00cb909153af1c6464f4f1ed9"
+SCHEMA_VERSION = 2
 
 MAX_CANDIDATE_BYTES = 2 * 1024 * 1024
 MAX_PATCH_BYTES = 1024 * 1024
@@ -49,11 +50,11 @@ MAX_ENABLE_OPTIONS = 64
 DEFAULT_BUILD_TIMEOUT_SECONDS = 4 * 60 * 60
 DEFAULT_INFRA_RETRIES = 2
 CONTROL_MARKER_SCHEMA_VERSION = 2
-CANDIDATE_PROOF_SCHEMA_VERSION = 1
-CANDIDATE_PROOF_VERSION = 1
-RUNTIME_RESULT_SCHEMA_VERSION = 1
-EVALUATION_RESULT_SCHEMA_VERSION = 1
-EVALUATION_ATTEMPT_SCHEMA_VERSION = 1
+CANDIDATE_PROOF_SCHEMA_VERSION = 2
+CANDIDATE_PROOF_VERSION = 2
+RUNTIME_RESULT_SCHEMA_VERSION = 2
+EVALUATION_RESULT_SCHEMA_VERSION = 2
+EVALUATION_ATTEMPT_SCHEMA_VERSION = 2
 CONTROL_CANDIDATE_PROOF_ID = "control"
 CONTROL_CANDIDATE_PROOF_SHA256 = "0" * 64
 
@@ -95,6 +96,7 @@ _ALLOWED_SOURCE_SUFFIXES = {
 _ALLOWED_ENABLE_OPTIONS = frozenset(
     {
         "active_mask_gap_pack_policy",
+        "commit_exact_event_policy",
         "commit_guard_event_buckets",
         "declared_value_compute_node_boundary",
         "deferred_activation_forward_policy",
@@ -247,6 +249,7 @@ class InfrastructureError(RuntimeError):
 @dataclass(frozen=True)
 class Candidate:
     schema_version: int
+    candidate_mode: str
     hypothesis: str
     evidence: tuple[str, ...]
     patch: str
@@ -258,12 +261,21 @@ class Candidate:
 
     @property
     def is_control(self) -> bool:
-        return not self.patch and not self.enable_options
+        return self.candidate_mode == "control"
+
+    @property
+    def is_default_path(self) -> bool:
+        return self.candidate_mode == "default-path"
+
+    @property
+    def is_explicit_options(self) -> bool:
+        return self.candidate_mode == "explicit-options"
 
     def canonical_json(self) -> str:
         return json.dumps(
             {
                 "schema_version": self.schema_version,
+                "candidate_mode": self.candidate_mode,
                 "hypothesis": self.hypothesis,
                 "evidence": list(self.evidence),
                 "patch": self.patch,
@@ -351,7 +363,14 @@ def parse_candidate_text(text: str) -> Candidate:
 
     if not isinstance(raw, dict):
         raise CandidateError("candidate must be a JSON object")
-    expected = {"schema_version", "hypothesis", "evidence", "patch", "enable_options"}
+    expected = {
+        "schema_version",
+        "candidate_mode",
+        "hypothesis",
+        "evidence",
+        "patch",
+        "enable_options",
+    }
     missing = expected - raw.keys()
     extra = raw.keys() - expected
     if missing:
@@ -361,17 +380,25 @@ def parse_candidate_text(text: str) -> Candidate:
     if type(raw["schema_version"]) is not int or raw["schema_version"] != SCHEMA_VERSION:
         raise CandidateError(f"schema_version must equal {SCHEMA_VERSION}")
 
+    candidate_mode = raw["candidate_mode"]
+    if not isinstance(candidate_mode, str) or candidate_mode not in {
+        "control",
+        "default-path",
+        "explicit-options",
+    }:
+        raise CandidateError(
+            "candidate_mode must be control, default-path, or explicit-options"
+        )
+
     hypothesis = raw["hypothesis"]
     if not isinstance(hypothesis, str) or not hypothesis.strip() or len(hypothesis) > 4000:
         raise CandidateError("hypothesis must be a non-empty string of at most 4000 characters")
 
     evidence_raw = raw["evidence"]
-    if isinstance(evidence_raw, str):
-        evidence = (evidence_raw.strip(),) if evidence_raw.strip() else ()
-    elif isinstance(evidence_raw, list) and all(isinstance(item, str) for item in evidence_raw):
+    if isinstance(evidence_raw, list) and all(isinstance(item, str) for item in evidence_raw):
         evidence = tuple(item.strip() for item in evidence_raw if item.strip())
     else:
-        raise CandidateError("evidence must be a non-empty string or array of strings")
+        raise CandidateError("evidence must be a non-empty array of strings in schema v2")
     if not evidence or len(evidence) > 32 or any(len(item) > 4000 for item in evidence):
         raise CandidateError("evidence must contain 1..32 non-empty items of at most 4000 characters")
 
@@ -380,14 +407,23 @@ def parse_candidate_text(text: str) -> Candidate:
         raise CandidateError("patch must be a string")
     validate_patch(patch, allow_empty=True)
 
+    if not isinstance(raw["enable_options"], list):
+        raise CandidateError("enable_options must be a name/value array in schema v2")
     enable_options = validate_enable_options(raw["enable_options"])
-    if bool(patch) != bool(enable_options):
+    mode_shape = (bool(patch), bool(enable_options))
+    expected_shape = {
+        "control": (False, False),
+        "default-path": (True, False),
+        "explicit-options": (True, True),
+    }[candidate_mode]
+    if mode_shape != expected_shape:
         raise CandidateError(
-            "non-control candidates require both a non-empty patch and enable_options; "
-            "the initial control requires both to be empty"
+            f"candidate_mode={candidate_mode} requires patch/options presence "
+            f"{expected_shape}, got {mode_shape}; only control may omit a patch"
         )
     return Candidate(
         schema_version=SCHEMA_VERSION,
+        candidate_mode=candidate_mode,
         hypothesis=hypothesis.strip(),
         evidence=evidence,
         patch=patch,
@@ -1485,43 +1521,12 @@ def _build_variant(
 
 def _control_artifacts(slot: Slot) -> BuildArtifacts:
     marker = slot.results_dir / "control_artifacts.json"
-    env_sh = slot.control_repo / "env.sh"
-    jobs = max(1, int(os.environ.get("GRHSIM_BUILD_JOBS", "4")))
-    expected_build_config = _build_config_fingerprint({}, jobs=jobs)
-    expected_toolchain = _toolchain_fingerprint(slot.control_repo, env_sh)
-    if marker.is_file():
+    if marker.is_file() and not marker.is_symlink():
         try:
-            raw = json.loads(marker.read_text(encoding="utf-8"))
-            artifacts = BuildArtifacts(
-                name="control",
-                repo=slot.control_repo,
-                binary=Path(raw["binary"]),
-                image=Path(raw["image"]),
-                nemu=Path(raw["nemu"]),
-                generated_fingerprint=raw["generated_fingerprint"],
-                build_log=Path(raw["build_log"]) if raw.get("build_log") else None,
-                build_config_fingerprint=raw["build_config_fingerprint"],
-                toolchain_fingerprint=raw["toolchain_fingerprint"],
+            artifacts, _artifact_sha256_by_name = _verify_control_artifact_identity(
+                slot
             )
-            binary, image, nemu = _artifact_paths(slot.control_repo)
-            artifact_sha256 = {
-                "binary": _sha256_file(binary),
-                "image": _sha256_file(image),
-                "nemu": _sha256_file(nemu),
-            }
-            if (
-                raw.get("schema_version") == CONTROL_MARKER_SCHEMA_VERSION
-                and raw.get("parent_commit") == PINNED_PARENT_COMMIT
-                and raw.get("wolvrix_commit") == PINNED_WOLVRIX_COMMIT
-                and binary == artifacts.binary
-                and image == artifacts.image
-                and nemu == artifacts.nemu
-                and generated_fingerprint(slot.control_repo) == artifacts.generated_fingerprint
-                and artifacts.build_config_fingerprint == expected_build_config
-                and artifacts.toolchain_fingerprint == expected_toolchain
-                and raw.get("artifact_sha256") == artifact_sha256
-            ):
-                return artifacts
+            return artifacts
         except Exception:
             pass
 
@@ -1547,6 +1552,113 @@ def _control_artifacts(slot: Slot) -> BuildArtifacts:
     return artifacts
 
 
+def _artifact_sha256(artifacts: BuildArtifacts) -> dict[str, str]:
+    return {
+        "binary": _sha256_file(artifacts.binary),
+        "image": _sha256_file(artifacts.image),
+        "nemu": _sha256_file(artifacts.nemu),
+    }
+
+
+def _verify_control_artifact_identity(
+    slot: Slot, expected: BuildArtifacts | None = None
+) -> tuple[BuildArtifacts, dict[str, str]]:
+    """Revalidate the immutable control incarnation without rebuilding it.
+
+    Candidate preparation can take hours.  The cached control therefore has to
+    be checked again immediately before a candidate proof is published, rather
+    than relying only on the check performed before the candidate build.
+    """
+
+    marker = slot.results_dir / "control_artifacts.json"
+    if marker.is_symlink() or not marker.is_file():
+        raise InfrastructureError(f"control artifact marker is not a regular file: {marker}")
+    try:
+        raw = json.loads(
+            marker.read_text(encoding="utf-8"),
+            object_pairs_hook=_reject_duplicate_keys,
+        )
+    except (OSError, UnicodeError, json.JSONDecodeError, CandidateError) as error:
+        raise InfrastructureError(f"cannot read control artifact marker: {error}") from error
+    if not isinstance(raw, dict):
+        raise InfrastructureError("control artifact marker is not a JSON object")
+
+    env_sh = slot.control_repo / "env.sh"
+    if env_sh.is_symlink() or not env_sh.is_file():
+        raise InfrastructureError(f"control env.sh is not a regular file: {env_sh}")
+    if env_sh.stat().st_size <= 0:
+        raise InfrastructureError(f"control env.sh is empty: {env_sh}")
+    _verify_pinned_repo(slot.control_repo, env_sh)
+    try:
+        artifacts = BuildArtifacts(
+            name=str(raw["name"]),
+            repo=Path(raw["repo"]),
+            binary=Path(raw["binary"]),
+            image=Path(raw["image"]),
+            nemu=Path(raw["nemu"]),
+            generated_fingerprint=str(raw["generated_fingerprint"]),
+            build_log=Path(raw["build_log"]) if raw.get("build_log") else None,
+            build_config_fingerprint=str(raw["build_config_fingerprint"]),
+            toolchain_fingerprint=str(raw["toolchain_fingerprint"]),
+        )
+    except (KeyError, TypeError, ValueError) as error:
+        raise InfrastructureError(f"malformed control artifact marker: {error}") from error
+
+    binary, image, nemu = _artifact_paths(slot.control_repo)
+    current = replace(
+        artifacts,
+        repo=slot.control_repo,
+        binary=binary,
+        image=image,
+        nemu=nemu,
+    )
+    jobs = max(1, int(os.environ.get("GRHSIM_BUILD_JOBS", "4")))
+    expected_build_config = _build_config_fingerprint({}, jobs=jobs)
+    expected_toolchain = _toolchain_fingerprint(slot.control_repo, env_sh)
+    artifact_sha256 = _artifact_sha256(current)
+    checks = {
+        "schema_version": type(raw.get("schema_version")) is int
+        and raw.get("schema_version") == CONTROL_MARKER_SCHEMA_VERSION,
+        "name": type(raw.get("name")) is str and artifacts.name == "control",
+        "repo": type(raw.get("repo")) is str and artifacts.repo == slot.control_repo,
+        "parent_commit": type(raw.get("parent_commit")) is str
+        and raw.get("parent_commit") == PINNED_PARENT_COMMIT,
+        "wolvrix_commit": type(raw.get("wolvrix_commit")) is str
+        and raw.get("wolvrix_commit") == PINNED_WOLVRIX_COMMIT,
+        "binary_path": artifacts.binary == binary,
+        "image_path": artifacts.image == image,
+        "nemu_path": artifacts.nemu == nemu,
+        "generated_fingerprint": generated_fingerprint(slot.control_repo)
+        == artifacts.generated_fingerprint,
+        "build_config_fingerprint": artifacts.build_config_fingerprint
+        == expected_build_config,
+        "toolchain_fingerprint": artifacts.toolchain_fingerprint == expected_toolchain,
+        "artifact_sha256": raw.get("artifact_sha256") == artifact_sha256,
+    }
+    if expected is not None:
+        checks.update(
+            {
+                "expected_name": expected.name == artifacts.name,
+                "expected_repo": expected.repo == artifacts.repo,
+                "expected_binary_path": expected.binary == artifacts.binary,
+                "expected_image_path": expected.image == artifacts.image,
+                "expected_nemu_path": expected.nemu == artifacts.nemu,
+                "expected_generated_fingerprint": expected.generated_fingerprint
+                == artifacts.generated_fingerprint,
+                "expected_build_config_fingerprint": expected.build_config_fingerprint
+                == artifacts.build_config_fingerprint,
+                "expected_toolchain_fingerprint": expected.toolchain_fingerprint
+                == artifacts.toolchain_fingerprint,
+            }
+        )
+    failed = sorted(name for name, passed in checks.items() if not passed)
+    if failed:
+        raise InfrastructureError(
+            "cached control artifact identity differs: " + ", ".join(failed)
+        )
+    return current, artifact_sha256
+
+
 def _canonical_enable_options(options: Mapping[str, bool | int | float | str]) -> str:
     return json.dumps(
         dict(sorted(options.items())),
@@ -1560,17 +1672,56 @@ def _candidate_proof_path(slot: Slot, candidate: Candidate) -> Path:
     return slot.results_dir / f"candidate_proof_{candidate.digest[:16]}.json"
 
 
+def _candidate_artifact_name(candidate: Candidate) -> str:
+    suffix = "default_path" if candidate.is_default_path else "explicit_options"
+    return f"candidate_{candidate.digest[:12]}_{suffix}"
+
+
 def _write_candidate_proof(
     candidate: Candidate,
     slot: Slot,
     control: BuildArtifacts,
     enabled: BuildArtifacts,
+    *,
+    control_artifact_sha256: Mapping[str, str],
+    control_env_sha256: str,
 ) -> BuildArtifacts:
+    verified_control, current_control_artifact_sha256 = _verify_control_artifact_identity(
+        slot, control
+    )
+    if current_control_artifact_sha256 != dict(control_artifact_sha256):
+        raise InfrastructureError(
+            "control artifact SHA-256 identity changed during candidate preparation"
+        )
+    current_control_env_sha256 = _sha256_file(verified_control.repo / "env.sh")
+    if current_control_env_sha256 != control_env_sha256:
+        raise InfrastructureError(
+            "control env.sh identity changed during candidate preparation"
+        )
+
+    candidate_binary, candidate_image, candidate_nemu = _artifact_paths(
+        enabled.repo, error_cls=CandidateError
+    )
+    if (
+        candidate_binary != enabled.binary
+        or candidate_image != enabled.image
+        or candidate_nemu != enabled.nemu
+    ):
+        raise CandidateError(
+            "candidate artifact paths changed after the gated build"
+        )
+    candidate_artifact_sha256 = _artifact_sha256(enabled)
+    for name in ("image", "nemu"):
+        if candidate_artifact_sha256[name] != control_artifact_sha256[name]:
+            label = "image" if name == "image" else "NEMU"
+            raise CandidateError(
+                f"candidate and control {label} SHA-256 differ"
+            )
+
     candidate_env = enabled.repo / "env.sh"
-    control_env = control.repo / "env.sh"
+    control_env = verified_control.repo / "env.sh"
     candidate_env_sha256 = _sha256_file(candidate_env)
-    control_env_sha256 = _sha256_file(control_env)
-    if candidate_env_sha256 != control_env_sha256:
+    if candidate_env_sha256 != current_control_env_sha256:
         raise InfrastructureError(
             "candidate and control env.sh differ after artifact preparation"
         )
@@ -1582,10 +1733,17 @@ def _write_candidate_proof(
         "proof_id": proof_id,
         "created_time_ns": time.time_ns(),
         "candidate_digest": candidate.digest,
+        "candidate_mode": candidate.candidate_mode,
         "patch_sha256": hashlib.sha256(candidate.patch.encode("utf-8")).hexdigest(),
         "canonical_enable_options": _canonical_enable_options(candidate.enable_options),
         "parent_commit": PINNED_PARENT_COMMIT,
         "wolvrix_commit": PINNED_WOLVRIX_COMMIT,
+        "control_identity": {
+            "generated_fingerprint": control.generated_fingerprint,
+            "build_config_fingerprint": control.build_config_fingerprint,
+            "toolchain_fingerprint": control.toolchain_fingerprint,
+            "artifact_sha256": dict(control_artifact_sha256),
+        },
         "repo": str(enabled.repo.resolve()),
         "generated_fingerprint": enabled.generated_fingerprint,
         "build_config_fingerprint": enabled.build_config_fingerprint,
@@ -1593,22 +1751,22 @@ def _write_candidate_proof(
         "artifacts": {
             "binary": {
                 "path": str(enabled.binary),
-                "sha256": _sha256_file(enabled.binary),
+                "sha256": candidate_artifact_sha256["binary"],
             },
             "image": {
                 "path": str(enabled.image),
-                "sha256": _sha256_file(enabled.image),
+                "sha256": candidate_artifact_sha256["image"],
             },
             "nemu": {
                 "path": str(enabled.nemu),
-                "sha256": _sha256_file(enabled.nemu),
+                "sha256": candidate_artifact_sha256["nemu"],
             },
         },
         "env_sh": {
             "candidate_path": str(candidate_env),
             "candidate_sha256": candidate_env_sha256,
             "control_path": str(control_env),
-            "control_sha256": control_env_sha256,
+            "control_sha256": current_control_env_sha256,
         },
     }
     proof_sha256 = _atomic_write_json(_candidate_proof_path(slot, candidate), payload)
@@ -1634,56 +1792,66 @@ def _prepare_artifacts(candidate: Candidate, slot: Slot) -> tuple[BuildArtifacts
             toolchain_fingerprint=control.toolchain_fingerprint,
         )
 
+    # Keep a pre-candidate-build identity in memory. A candidate-controlled
+    # build must not be able to mutate both the control artifacts and their
+    # on-disk marker into a coordinated, self-consistent replacement.
+    control_artifact_sha256 = _artifact_sha256(control)
+    control_env_sha256 = _sha256_file(control.repo / "env.sh")
+
     candidate_env = _prepare_candidate_clone(slot.control_repo, slot.root, slot.candidate_repo)
     generation_inputs = _stage_control_generation_inputs(
         slot.control_repo, slot.candidate_repo
     )
-    # Attribute executable changes to the patch rather than to an existing
-    # historical knob alone.  This unpatched/same-options build is a static
-    # causal gate; formal runtime still compares against current-default as
-    # required by the benchmark contract.
-    option_control_fingerprint = _emit_only_fingerprint(
-        slot.candidate_repo,
-        name=f"candidate_{candidate.digest[:12]}_unpatched_options",
-        options=candidate.enable_options,
-        results_dir=slot.results_dir,
-    )
-    _verify_generation_inputs_unchanged(
-        slot.candidate_repo,
-        generation_inputs,
-        phase="after the unpatched same-options emit",
-    )
+    option_control_fingerprint: str | None = None
+    if candidate.is_explicit_options:
+        # Attribute executable changes to the patch rather than to an existing
+        # historical knob alone. This gate is meaningful only when the
+        # candidate explicitly selects an option.
+        option_control_fingerprint = _emit_only_fingerprint(
+            slot.candidate_repo,
+            name=f"candidate_{candidate.digest[:12]}_unpatched_options",
+            options=candidate.enable_options,
+            results_dir=slot.results_dir,
+        )
+        _verify_generation_inputs_unchanged(
+            slot.candidate_repo,
+            generation_inputs,
+            phase="after the unpatched same-options emit",
+        )
+
     _apply_candidate_patch(candidate, slot.candidate_repo, candidate_env)
-    disabled = _build_variant(
-        slot.candidate_repo,
-        name=f"candidate_{candidate.digest[:12]}_disabled",
-        options={},
-        results_dir=slot.results_dir,
-        clean_first=True,
-        candidate_owned=True,
-        trusted_tests_repo=slot.control_repo,
-    )
-    _verify_generation_inputs_unchanged(
-        slot.candidate_repo,
-        generation_inputs,
-        phase="after the default-off candidate build",
-    )
-    if disabled.build_config_fingerprint != control.build_config_fingerprint:
-        raise InfrastructureError(
-            "default-off candidate and control used different build/link configurations"
+    if candidate.is_explicit_options:
+        disabled = _build_variant(
+            slot.candidate_repo,
+            name=f"candidate_{candidate.digest[:12]}_disabled",
+            options={},
+            results_dir=slot.results_dir,
+            clean_first=True,
+            candidate_owned=True,
+            trusted_tests_repo=slot.control_repo,
         )
-    if disabled.toolchain_fingerprint != control.toolchain_fingerprint:
-        raise InfrastructureError(
-            "default-off candidate and control used different toolchains"
+        _verify_generation_inputs_unchanged(
+            slot.candidate_repo,
+            generation_inputs,
+            phase="after the default-off candidate build",
         )
-    if disabled.generated_fingerprint != control.generated_fingerprint:
-        raise CandidateError(
-            "candidate changes generated C++ while enable_options are absent; optimization is not default-off"
-        )
+        if disabled.build_config_fingerprint != control.build_config_fingerprint:
+            raise InfrastructureError(
+                "default-off candidate and control used different build/link configurations"
+            )
+        if disabled.toolchain_fingerprint != control.toolchain_fingerprint:
+            raise InfrastructureError(
+                "default-off candidate and control used different toolchains"
+            )
+        if disabled.generated_fingerprint != control.generated_fingerprint:
+            raise CandidateError(
+                "explicit-options candidate changes generated C++ while options are absent; "
+                "use candidate_mode=default-path for a native-default change"
+            )
 
     enabled = _build_variant(
         slot.candidate_repo,
-        name=f"candidate_{candidate.digest[:12]}_enabled",
+        name=_candidate_artifact_name(candidate),
         options=candidate.enable_options,
         results_dir=slot.results_dir,
         clean_first=True,
@@ -1696,16 +1864,35 @@ def _prepare_artifacts(candidate: Candidate, slot: Slot) -> tuple[BuildArtifacts
         phase="after the enabled candidate build",
     )
     if enabled.generated_fingerprint == control.generated_fingerprint:
-        raise CandidateError(
-            "enabled candidate generated the same C++/headers as control; "
-            "enable_options are unsupported or the patch has no executable effect"
+        detail = (
+            "native default-path patch has no generated executable effect"
+            if candidate.is_default_path
+            else "explicit options are unsupported or the patch has no executable effect"
         )
-    if enabled.generated_fingerprint == option_control_fingerprint:
+        raise CandidateError(f"candidate generated the same C++/headers as control; {detail}")
+    if (
+        candidate.is_explicit_options
+        and enabled.generated_fingerprint == option_control_fingerprint
+    ):
         raise CandidateError(
-            "enabled candidate is byte-identical to the unpatched same-options build; "
+            "explicit-options candidate is byte-identical to the unpatched same-options build; "
             "the patch has no attributable executable effect"
         )
-    enabled = _write_candidate_proof(candidate, slot, control, enabled)
+    if enabled.build_config_fingerprint != _build_config_fingerprint(
+        candidate.enable_options,
+        jobs=max(1, int(os.environ.get("GRHSIM_BUILD_JOBS", "4"))),
+    ):
+        raise InfrastructureError("candidate build configuration fingerprint is inconsistent")
+    if enabled.toolchain_fingerprint != control.toolchain_fingerprint:
+        raise InfrastructureError("candidate and control used different toolchains")
+    enabled = _write_candidate_proof(
+        candidate,
+        slot,
+        control,
+        enabled,
+        control_artifact_sha256=control_artifact_sha256,
+        control_env_sha256=control_env_sha256,
+    )
     return control, enabled
 
 
@@ -1743,6 +1930,7 @@ def _runtime_config(
         "results_dir": str(slot.results_dir / f"runtime_{candidate.digest[:16]}"),
         "candidate_spec": {
             "digest": candidate.digest,
+            "candidate_mode": candidate.candidate_mode,
             "enable_options": candidate.enable_options,
         },
         "group_order": group_order,
@@ -2031,6 +2219,7 @@ def _publish_evaluation_attempt(
         "attempt_id": attempt_id,
         "candidate_digest": candidate.digest[:16],
         "candidate_digest_full": candidate.digest,
+        "candidate_mode": candidate.candidate_mode,
         "candidate_proof_id": proof_id,
         "candidate_proof_sha256": proof_sha256,
     }
@@ -2060,6 +2249,7 @@ def _publish_evaluation_attempt(
         "attempt_id": attempt_id,
         "created_time_ns": created_time_ns,
         "candidate_digest": candidate.digest,
+        "candidate_mode": candidate.candidate_mode,
         "candidate_proof_id": proof_id,
         "candidate_proof_sha256": proof_sha256,
         "runtime_result_sha256": runtime_sha256,
@@ -2143,6 +2333,7 @@ def evaluate(
             metrics = score_runtime_result(result)
             metrics["eval_time"] = float(time.monotonic() - started)
             metrics["candidate_digest"] = candidate.digest[:16]
+            metrics["candidate_mode"] = candidate.candidate_mode
             metrics["candidate_files"] = len(validate_patch(candidate.patch, allow_empty=True))
             metrics["enable_option_count"] = len(candidate.enable_options)
             metrics["parent_commit"] = PINNED_PARENT_COMMIT[:12]
@@ -2183,6 +2374,7 @@ def main() -> int:
             result = {
                 "valid": True,
                 "candidate_digest": candidate.digest,
+                "candidate_mode": candidate.candidate_mode,
                 "files": list(validate_patch(candidate.patch, allow_empty=True)),
                 "enable_options": candidate.enable_options,
             }

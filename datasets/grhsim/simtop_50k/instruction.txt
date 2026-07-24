@@ -14,18 +14,38 @@ useful only if the fixed-ASLR, functionally equivalent end-to-end run improves.
 Return exactly one JSON object matching `candidate.schema.json`. The backend
 will place it between the EVOLVE-BLOCK markers. Its fields mean:
 
-- `schema_version`: always `1`.
+- `schema_version`: always `2`.
+- `candidate_mode`: one of `default-path` or `explicit-options` for every newly
+  generated candidate. `control` is reserved for the initial no-op seed.
 - `hypothesis`: the precise mechanism and expected end-to-end effect.
 - `evidence`: repository paths plus absolute observed counts/timings/profile
   facts that motivated this candidate. Never invent measurements.
 - `patch`: a complete `git diff`-style unified diff relative to
-  `wolvrix@f17e90e`. It must end with a newline.
-- `enable_options`: a non-empty array of `{ "name": snake_case, "value": ... }`
-  entries that explicitly enable the candidate during generation. Names map to
-  `WOLVRIX_XS_GRHSIM_<UPPER_CASE_NAME>` and must be members of the explicit
-  optimization allowlist in `candidate.schema.json`. Reuse an existing
+  `wolvrix@8f6ba14`. It must end with a newline.
+- `enable_options`: an array of `{ "name": snake_case, "value": ... }` entries.
+  It must be empty for `default-path` and non-empty for `explicit-options`.
+  Names map to `WOLVRIX_XS_GRHSIM_<UPPER_CASE_NAME>` and must be members of the
+  explicit optimization allowlist in `candidate.schema.json`. Reuse an existing
   default-off experimental policy when refining its implementation. Diagnostic
   `probe`/profile/report/stats/trace/dump/export values are forbidden.
+
+Choose the attribution mode from the code path you are changing:
+
+- `default-path`: use a non-empty patch and empty `enable_options` when refining
+  behavior reached by the pinned native C++ defaults. The evaluator builds the
+  patched tree with native options `{}` and requires its generated C++/headers
+  to differ from the unpatched current-default control.
+- `explicit-options`: use both a non-empty patch and non-empty `enable_options`
+  when refining a genuinely default-off policy. The evaluator requires the
+  patched no-options build to equal control, and requires the enabled output to
+  differ from both control and an unpatched same-options emit.
+
+`active_mask_gap_pack_policy=targeted-direct` controls only its non-table direct
+active-mask gap-packing transformation. It is not an umbrella gate for exact
+event/commit optimizations. `commit_exact_event_policy` is the independent
+control for that mechanism; when its optimized behavior is already the native
+default, refine it with `candidate_mode=default-path`, not by borrowing
+`targeted-direct`.
 
 Hard constraints:
 
@@ -36,12 +56,14 @@ Hard constraints:
    the patch is applied inside that submodule.
 2. Never modify the benchmark, runner, workload, timing output, GSIM reference,
    generated files, parent-repository scripts, documentation, submodule
-   pointers, external dependencies, or default/current production behavior.
-3. The optimization must be default-off: without `enable_options`, generated
-   source must remain byte-identical to the pinned current-default control.
-   With `enable_options`, your patched output must also differ from an
-   unpatched build using the same options; an existing knob's old behavior is
-   not attributable evidence for a no-op patch.
+   pointers, or external dependencies. A `default-path` patch may deliberately
+   change current native-default generation only through the allowed wolvrix
+   source files and is always measured against the pinned unpatched control.
+3. Declare attribution exactly. `default-path` requires patch/non-empty and
+   options/empty. `explicit-options` requires both patch and options non-empty
+   and must remain byte-identical to control with options absent. `control`
+   requires both empty and is forbidden for generated proposals. The evaluator
+   cross-checks these shapes rather than trusting the mode label.
 4. Do not use absolute paths, path traversal, symlinks, executable/binary diffs,
    rename/copy directives, shell fragments, or credentials. Do not read, quote,
    expose, or place any API key/authentication material in the response.
@@ -53,7 +75,7 @@ Hard constraints:
    performance result.
 6. Prefer a small, attributable candidate. Do not bundle unrelated ideas.
 
-The initial program is either the special no-op control or a previously
-evaluated best candidate supplied for a fresh continuation run. Regardless of
-the seed, every newly generated candidate must contain both a non-empty patch
-and at least one `enable_options` entry.
+The initial program is either the schema-v2 special no-op `control` or a
+previously evaluated schema-v2 best candidate supplied for a fresh continuation
+run. Regardless of the seed, every newly generated candidate must contain a
+non-empty patch and select exactly one of the two non-control modes above.

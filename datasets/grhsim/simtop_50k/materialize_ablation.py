@@ -35,6 +35,7 @@ def main() -> int:
     source = parse_candidate_text(matches[0]["code"])
     payload = {
         "schema_version": source.schema_version,
+        "candidate_mode": source.candidate_mode,
         "hypothesis": (
             f"Fresh controlled ablation arm {args.label}, mechanically preserving "
             f"the exact source patch and enable options from checkpoint gen "
@@ -49,7 +50,10 @@ def main() -> int:
             ),
         ],
         "patch": source.patch,
-        "enable_options": source.enable_options,
+        "enable_options": [
+            {"name": name, "value": value}
+            for name, value in source.enable_options.items()
+        ],
     }
     document = (
         f"{START_MARKER}\n"

@@ -5,6 +5,7 @@
   "additionalProperties": false,
   "required": [
     "schema_version",
+    "candidate_mode",
     "hypothesis",
     "evidence",
     "patch",
@@ -13,7 +14,11 @@
   "properties": {
     "schema_version": {
       "type": "integer",
-      "const": 1
+      "const": 2
+    },
+    "candidate_mode": {
+      "type": "string",
+      "enum": ["default-path", "explicit-options"]
     },
     "hypothesis": {
       "type": "string",
@@ -46,6 +51,7 @@
             "type": "string",
             "enum": [
               "active_mask_gap_pack_policy",
+              "commit_exact_event_policy",
               "commit_guard_event_buckets",
               "declared_value_compute_node_boundary",
               "deferred_activation_forward_policy",
@@ -133,5 +139,21 @@
         }
       }
     }
-  }
+  },
+  "oneOf": [
+    {
+      "properties": {
+        "candidate_mode": {"const": "default-path"},
+        "patch": {"minLength": 1},
+        "enable_options": {"maxItems": 0}
+      }
+    },
+    {
+      "properties": {
+        "candidate_mode": {"const": "explicit-options"},
+        "patch": {"minLength": 1},
+        "enable_options": {"minItems": 1}
+      }
+    }
+  ]
 }

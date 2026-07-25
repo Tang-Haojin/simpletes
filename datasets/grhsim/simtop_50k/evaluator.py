@@ -395,12 +395,16 @@ def parse_candidate_text(text: str) -> Candidate:
         raise CandidateError("hypothesis must be a non-empty string of at most 4000 characters")
 
     evidence_raw = raw["evidence"]
-    if isinstance(evidence_raw, list) and all(isinstance(item, str) for item in evidence_raw):
-        evidence = tuple(item.strip() for item in evidence_raw if item.strip())
-    else:
+    if not isinstance(evidence_raw, list) or not all(
+        isinstance(item, str) for item in evidence_raw
+    ):
         raise CandidateError("evidence must be a non-empty array of strings in schema v2")
-    if not evidence or len(evidence) > 32 or any(len(item) > 4000 for item in evidence):
+    if (
+        not 1 <= len(evidence_raw) <= 32
+        or any(not item.strip() or len(item) > 4000 for item in evidence_raw)
+    ):
         raise CandidateError("evidence must contain 1..32 non-empty items of at most 4000 characters")
+    evidence = tuple(item.strip() for item in evidence_raw)
 
     patch = raw["patch"]
     if not isinstance(patch, str):

@@ -126,7 +126,12 @@ older evaluator revisions without this proof are deliberately not reusable.
 the two non-control proposal modes. The evaluator parser separately accepts the
 `control` shape as an init-only special case, so the pinned seed and
 `--validate-only` remain usable without allowing an LLM to propose another
-control. Patch paths are limited to existing tracked C/C++ source/header files under `wolvrix/lib`,
+control. The provider-facing schema is deliberately a flat object without
+cross-field `oneOf` conditionals or size-bound keywords unsupported by the
+Codex structured-output API. Field descriptions state the mode rules, while
+the evaluator remains the authoritative fail-closed enforcement point for
+non-empty patch/options shape, cardinality, size, and value safety. Patch paths
+are limited to existing tracked C/C++ source/header files under `wolvrix/lib`,
 `wolvrix/include`, and `wolvrix/app/pybind`; additions, deletions, binary,
 symlink, executable, rename, traversal, generated-output, submodule, harness,
 build-description, test, and secret-bearing patches are rejected before

@@ -173,6 +173,40 @@ def test_model_output_schema_rejects_control_proposals():
     )
 
 
+def test_model_output_schema_uses_provider_compatible_flat_contract():
+    schema = json.loads((TASK_ROOT / "candidate.schema.json").read_text(encoding="utf-8"))
+    unsupported = {
+        "oneOf",
+        "allOf",
+        "not",
+        "if",
+        "then",
+        "else",
+        "dependentRequired",
+        "dependentSchemas",
+        "minLength",
+        "maxLength",
+        "minItems",
+        "maxItems",
+    }
+
+    def visit(value):
+        if isinstance(value, dict):
+            for key, child in value.items():
+                assert key not in unsupported
+                visit(child)
+        elif isinstance(value, list):
+            for child in value:
+                visit(child)
+
+    Draft202012Validator.check_schema(schema)
+    visit(schema)
+    assert schema["type"] == "object"
+    assert schema["additionalProperties"] is False
+    assert set(schema["required"]) == set(schema["properties"])
+    assert "anyOf" not in schema
+
+
 def test_candidate_parser_accepts_marked_json_and_canonicalizes_evidence():
     candidate = evaluator.parse_candidate_text(_candidate_text(evidence=["one fact"]))
 
@@ -182,6 +216,14 @@ def test_candidate_parser_accepts_marked_json_and_canonicalizes_evidence():
 
     with pytest.raises(evaluator.CandidateError, match="array of strings"):
         evaluator.parse_candidate_text(_candidate_text(evidence="one fact"))
+
+    for invalid_evidence in (
+        ["one fact", " "],
+        [f"fact {index}" for index in range(33)],
+        [" " * 4001],
+    ):
+        with pytest.raises(evaluator.CandidateError, match="1..32 non-empty items"):
+            evaluator.parse_candidate_text(_candidate_text(evidence=invalid_evidence))
 
 
 def test_candidate_parser_normalizes_structured_output_option_entries():

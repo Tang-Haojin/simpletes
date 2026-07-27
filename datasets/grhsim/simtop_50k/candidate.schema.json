@@ -23,18 +23,18 @@
     },
     "hypothesis": {
       "type": "string",
-      "description": "A non-empty hypothesis of at most 4000 characters; the evaluator enforces the bound."
+      "description": "A non-empty, non-placeholder concrete optimization mechanism and expected end-to-end effect. The evaluator and capability semantic validator enforce the 4000-character bound."
     },
     "evidence": {
       "type": "array",
       "items": {
         "type": "string"
       },
-      "description": "One to 32 non-empty evidence strings, each at most 4000 characters; the evaluator enforces the bounds."
+      "description": "One to 32 non-empty, non-placeholder repository paths, absolute observations, or profile facts; each is at most 4000 characters. The evaluator and capability semantic validator enforce these bounds."
     },
     "patch": {
       "type": "string",
-      "description": "A non-empty safe unified diff. The evaluator enforces size, path, syntax, and candidate-mode constraints."
+      "description": "A non-empty safe unified diff ending in a newline. The evaluator and capability semantic validator enforce size, syntax, path, and newline constraints."
     },
     "enable_options": {
       "type": "array",

@@ -66,6 +66,9 @@ def create_llm_client(config: EngineConfig) -> LLMBackend:
             auth_path=config.codex_auth_path,
             repo_root=config.codex_repo_root,
             output_schema=config.codex_output_schema,
+            local_validation_schema=config.codex_local_validation_schema,
+            output_mode=config.codex_output_mode,
+            tool_choice_mode=config.codex_tool_choice_mode,
             timeout=config.timeout,
             pool_size=config.gen_concurrency,
         )

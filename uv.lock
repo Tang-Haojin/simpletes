@@ -2394,6 +2394,7 @@ version = "1.0.0"
 source = { virtual = "." }
 dependencies = [
     { name = "cython" },
+    { name = "httpx" },
     { name = "jsonschema" },
     { name = "litellm" },
     { name = "matplotlib" },
@@ -2412,6 +2413,7 @@ dependencies = [
 [package.metadata]
 requires-dist = [
     { name = "cython", specifier = ">=3.0.0" },
+    { name = "httpx", specifier = ">=0.27.0" },
     { name = "jsonschema", specifier = ">=4.0.0" },
     { name = "litellm", specifier = ">=1.80.0" },
     { name = "matplotlib", specifier = ">=3.10.8" },

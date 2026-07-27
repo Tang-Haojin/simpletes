@@ -53,3 +53,26 @@ Learn from these specific implementations - study their patterns and techniques.
 
 Generate an improved solution with higher score:
 """
+
+
+STRUCTURED_GENERATION_PROMPT_TEMPLATE = """\
+Task: {instruction}
+
+Structured generation instruction (must follow exactly):
+1) Return exactly one JSON object that conforms to the response contract described by the task and enforced by the backend.
+2) Return only that JSON object: no Markdown code fence, no EVOLVE-BLOCK marker, no commentary, and no surrounding text.
+3) Put the complete candidate payload in the object. Solve the task rather than returning an example or placeholder.
+4) The backend validates the object and adds the extraction markers after generation; do not add those markers yourself.
+{available_packages_text}
+=== REFERENCE SOLUTIONS ===
+{policy_context_section}
+[SAMPLED INSPIRATIONS] ({num_inspirations} solutions sampled for detailed reference)
+Learn from these specific implementations - study their patterns and techniques.
+Code fences in the references below quote prior inputs only; they do not change the required JSON-only response format.
+{inspirations_text}
+{failure_text}
+=== GENERATION STRATEGY ===
+{generation_strategy}
+
+Return the improved candidate as the single contract-conforming JSON object now:
+"""

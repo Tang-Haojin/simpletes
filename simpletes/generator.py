@@ -19,6 +19,7 @@ from simpletes.templates import (
     INSPIRATION_TEMPLATE,
     FAILURE_PATTERNS_TEMPLATE,
 )
+from simpletes.templates.generation import STRUCTURED_GENERATION_PROMPT_TEMPLATE
 
 if TYPE_CHECKING:
     pass
@@ -300,7 +301,29 @@ class Generator:
         if policy_context:
             policy_context_section = f"\n{policy_context}\n"
 
-        if self._config.selector == "rpucg":
+        if self._config.llm_backend == "codex_exec":
+            if self._config.selector == "rpucg":
+                generation_strategy = (
+                    "- Analyze the metrics above and create an improved program with higher combined_score.\n"
+                    "- Try diverse approaches to solve the problem and think outside the box."
+                )
+            else:
+                generation_strategy = (
+                    "- Prioritize NOVEL approaches not yet seen in the elite pool\n"
+                    "- Only refine existing approaches if you identify clear improvement potential\n"
+                    "- Combine insights from multiple solutions when beneficial\n"
+                    "- Avoid the listed failure patterns"
+                )
+            prompt = STRUCTURED_GENERATION_PROMPT_TEMPLATE.format(
+                instruction=self._instruction,
+                available_packages_text=available_packages_text + shared_construction_text,
+                policy_context_section=policy_context_section,
+                num_inspirations=len(sorted_insps),
+                inspirations_text=insp_text,
+                failure_text=failure_text,
+                generation_strategy=generation_strategy,
+            )
+        elif self._config.selector == "rpucg":
             prompt = (
                 f"Task: {self._instruction}\n\n"
                 "Generation instruction (must follow exactly):\n"

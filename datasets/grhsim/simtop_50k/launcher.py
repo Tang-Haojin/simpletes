@@ -7,13 +7,17 @@ import argparse
 import asyncio
 from dataclasses import dataclass
 from datetime import datetime
+import hashlib
 import importlib.util
 import json
 import os
 from pathlib import Path
+import re
+import secrets
 import shlex
 import subprocess
 import sys
+import tempfile
 from types import ModuleType
 from typing import Any
 
@@ -24,9 +28,35 @@ DEFAULT_TARGET_REPO = SIMPLETES_ROOT.parent / "wolvrix-playground-gsim-calibrate
 DEFAULT_CODEX_CONFIG = Path("~/.codex/config.kimi.toml").expanduser()
 DEFAULT_CODEX_AUTH = Path("~/.codex/auth.kimi.json").expanduser()
 DEFAULT_INIT_PROGRAM = TASK_ROOT / "init_program.txt"
+LOCAL_VALIDATION_SCHEMA = TASK_ROOT / "candidate.local.schema.json"
 MODEL = "k3"
 REASONING_EFFORT = "ultra"
 MAX_PROPOSALS = 64
+DEFAULT_PREFLIGHT_TIMEOUT = 600.0
+PREFLIGHT_PROBE_PATH = "wolvrix/lib/emit/grhsim_cpp.cpp"
+PREFLIGHT_PROBE_SUBMODULE_PATH = "lib/emit/grhsim_cpp.cpp"
+PREFLIGHT_EVIDENCE_PREFIX = "repo_probe_attestation="
+PREFLIGHT_SMOKE_HYPOTHESIS = (
+    "Capability smoke only: reorder two standard-library includes with no "
+    "intended semantic or performance effect."
+)
+PREFLIGHT_SMOKE_PATCH = (
+    "diff --git a/lib/emit/grhsim_cpp.cpp b/lib/emit/grhsim_cpp.cpp\n"
+    "--- a/lib/emit/grhsim_cpp.cpp\n"
+    "+++ b/lib/emit/grhsim_cpp.cpp\n"
+    "@@ -6,7 +6,7 @@\n"
+    " \n"
+    " #include <algorithm>\n"
+    "-#include <atomic>\n"
+    " #include <array>\n"
+    "+#include <atomic>\n"
+    " #include <cctype>\n"
+    " #include <chrono>\n"
+    " #include <cstdio>\n"
+)
+_PLACEHOLDER_RE = re.compile(
+    r"\s*(?:placeholder|dummy|todo|tbd|unknown|n/?a)\s*[.!]?\s*", re.I
+)
 
 
 @dataclass(frozen=True)
@@ -168,31 +198,420 @@ def _regular_file(path: Path, label: str) -> Path:
     return resolved
 
 
+def _launch_guard_digest(
+    args: argparse.Namespace, command: list[str] | None = None
+) -> str:
+    """Fingerprint runtime inputs so a long preflight cannot gate newer code."""
+    paths = {
+        *SIMPLETES_ROOT.joinpath("simpletes").rglob("*.py"),
+        *TASK_ROOT.glob("*.py"),
+        *TASK_ROOT.glob("*.json"),
+        *TASK_ROOT.glob("*.txt"),
+        SIMPLETES_ROOT / "main.py",
+        Path(args.target_repo).expanduser() / "env.sh",
+        Path(args.codex_config).expanduser(),
+        Path(args.codex_auth).expanduser(),
+        Path(args.init_program).expanduser(),
+    }
+    if command is not None:
+        for flag in (
+            "--init-program",
+            "--evaluator",
+            "--instruction",
+            "--codex-config",
+            "--codex-auth",
+            "--codex-output-schema",
+            "--codex-local-validation-schema",
+        ):
+            if flag in command:
+                index = command.index(flag)
+                if index + 1 >= len(command):
+                    raise SystemExit("cannot fingerprint SimpleTES launch inputs")
+                paths.add(Path(command[index + 1]))
+        if "--resume" in command:
+            index = command.index("--resume")
+            if index + 1 >= len(command):
+                raise SystemExit("cannot fingerprint SimpleTES launch inputs")
+            resume_state = Path(command[index + 1])
+            if resume_state.is_symlink() or not resume_state.is_dir():
+                raise SystemExit("cannot fingerprint SimpleTES launch inputs")
+            paths.update(
+                path
+                for path in resume_state.rglob("*")
+                if path.is_file() or path.is_symlink()
+            )
+    digest = hashlib.sha256()
+    try:
+        for unresolved in sorted(paths, key=lambda item: str(item)):
+            if unresolved.is_symlink():
+                raise OSError("guard input is a symbolic link")
+            path = unresolved.resolve(strict=True)
+            if not path.is_file():
+                raise OSError("guard input is not a regular file")
+            encoded_path = str(path).encode("utf-8")
+            digest.update(len(encoded_path).to_bytes(8, "big"))
+            digest.update(encoded_path)
+            with path.open("rb") as stream:
+                while chunk := stream.read(1024 * 1024):
+                    digest.update(len(chunk).to_bytes(8, "big"))
+                    digest.update(chunk)
+            digest.update((0).to_bytes(8, "big"))
+    except (OSError, UnicodeError):
+        raise SystemExit("cannot fingerprint SimpleTES launch inputs") from None
+    return digest.hexdigest()
+
+
+def _clean_git_environment(**overrides: str) -> dict[str, str]:
+    """Drop caller-controlled Git routing before inspecting pinned objects."""
+    environment = {
+        key: value
+        for key, value in os.environ.items()
+        if not key.upper().startswith("GIT_")
+    }
+    environment.update(
+        {
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_OPTIONAL_LOCKS": "0",
+            **overrides,
+        }
+    )
+    return environment
+
+
+def _git_bytes(repo: Path, arguments: list[str], label: str) -> bytes:
+    try:
+        completed = subprocess.run(
+            ["git", "-C", str(repo), *arguments],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=_clean_git_environment(),
+        )
+    except OSError as error:
+        raise SystemExit(f"cannot inspect {label} in the target repository") from error
+    if completed.returncode != 0:
+        raise SystemExit(f"cannot inspect {label} in the target repository")
+    return completed.stdout
+
+
+def _pinned_probe_digest(
+    target_repo: Path, evaluator: ModuleType, challenge_nonce: str
+) -> str:
+    """Bind a fresh challenge to one immutable blob outside the model process."""
+    if re.fullmatch(r"[0-9a-f]{64}", challenge_nonce) is None:
+        raise SystemExit("preflight challenge nonce must be 64 lowercase hex digits")
+    parent = _git_bytes(
+        target_repo,
+        ["rev-parse", "--verify", f"{evaluator.PINNED_PARENT_COMMIT}^{{commit}}"],
+        "pinned parent commit",
+    ).decode("ascii", errors="strict").strip()
+    if parent != evaluator.PINNED_PARENT_COMMIT:
+        raise SystemExit("target repository does not contain the pinned parent commit")
+    gitlink = _git_bytes(
+        target_repo,
+        ["rev-parse", "--verify", f"{parent}:wolvrix"],
+        "pinned Wolvrix gitlink",
+    ).decode("ascii", errors="strict").strip()
+    if gitlink != evaluator.PINNED_WOLVRIX_COMMIT:
+        raise SystemExit("pinned parent commit has an unexpected Wolvrix gitlink")
+
+    wolvrix_repo = target_repo / "wolvrix"
+    wolvrix_commit = _git_bytes(
+        wolvrix_repo,
+        ["rev-parse", "--verify", f"{evaluator.PINNED_WOLVRIX_COMMIT}^{{commit}}"],
+        "pinned Wolvrix commit",
+    ).decode("ascii", errors="strict").strip()
+    if wolvrix_commit != evaluator.PINNED_WOLVRIX_COMMIT:
+        raise SystemExit("target repository does not contain the pinned Wolvrix commit")
+    blob = _git_bytes(
+        wolvrix_repo,
+        ["show", f"{wolvrix_commit}:{PREFLIGHT_PROBE_SUBMODULE_PATH}"],
+        "pinned preflight source blob",
+    )
+    if not blob:
+        raise SystemExit("pinned preflight source blob is empty")
+    return hashlib.sha256(
+        challenge_nonce.encode("ascii") + b"\0" + blob
+    ).hexdigest()
+
+
+def _preflight_prompt(evaluator: ModuleType, challenge_nonce: str) -> str:
+    """Build a small deterministic capability probe, not a research request."""
+    smoke_hypothesis_json = json.dumps(
+        PREFLIGHT_SMOKE_HYPOTHESIS, ensure_ascii=False
+    )
+    smoke_patch_json = json.dumps(PREFLIGHT_SMOKE_PATCH, ensure_ascii=False)
+    return f"""\
+CAPABILITY PREFLIGHT ONLY. This is not performance research, and this response
+will never be evaluated or retained as an optimization. Do not inspect prior
+experiments, generated code, profiles, or unrelated files. Do not modify the
+checkout. Use a read-only repository shell, perform the pinned-blob challenge
+below, and then return the JSON immediately.
+
+You must invoke at least one repository tool. Read the tracked blob with
+`git -C wolvrix show {evaluator.PINNED_WOLVRIX_COMMIT}:{PREFLIGHT_PROBE_SUBMODULE_PATH}`.
+Compute lowercase SHA-256 over the exact byte concatenation
+ASCII({challenge_nonce}) + one NUL byte + that blob. Hash the pinned blob, not
+the worktree file, and do not use a previously published digest. The expected
+digest is intentionally absent.
+
+Return exactly one JSON object with these six fields and no Markdown or prose:
+- `schema_version`: integer 2
+- `candidate_mode`: string `default-path`
+- `hypothesis`: exactly the JSON string {smoke_hypothesis_json}
+- `evidence`: an array containing exactly one string,
+  `repo_probe_attestation=<your 64 lowercase hex digest>`
+- `patch`: exactly the JSON string {smoke_patch_json}
+- `enable_options`: an empty array
+
+Copy the supplied patch byte-for-byte, including its final newline. Do not
+invent an optimization, return a placeholder, use control mode, or call more
+tools after the digest has been computed.
+"""
+
+
+def _check_pinned_patch(
+    target_repo: Path,
+    evaluator: ModuleType,
+    patch: str,
+    changed_paths: tuple[str, ...],
+) -> str | None:
+    """Apply a smoke patch to isolated temporary Git index and object storage."""
+    wolvrix_repo = target_repo / "wolvrix"
+    try:
+        with tempfile.TemporaryDirectory(prefix="simpletes-preflight-index-") as temp:
+            temp_root = Path(temp)
+            index_path = temp_root / "index"
+            object_path = temp_root / "objects"
+            object_path.mkdir(mode=0o700)
+            common_dir_result = subprocess.run(
+                [
+                    "git",
+                    "-C",
+                    str(wolvrix_repo),
+                    "rev-parse",
+                    "--path-format=absolute",
+                    "--git-common-dir",
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env=_clean_git_environment(),
+                check=False,
+            )
+            if common_dir_result.returncode != 0:
+                return "cannot locate pinned Wolvrix object storage"
+            common_dir = Path(
+                common_dir_result.stdout.decode("utf-8", errors="strict").strip()
+            ).resolve(strict=True)
+            alternate_objects = (common_dir / "objects").resolve(strict=True)
+            if not alternate_objects.is_dir() or ":" in str(alternate_objects):
+                return "cannot isolate pinned Wolvrix object storage"
+            environment = _clean_git_environment(
+                GIT_INDEX_FILE=str(index_path),
+                GIT_OBJECT_DIRECTORY=str(object_path),
+                GIT_ALTERNATE_OBJECT_DIRECTORIES=str(alternate_objects),
+            )
+
+            def run(arguments: list[str], *, input_bytes: bytes | None = None):
+                return subprocess.run(
+                    ["git", "-C", str(wolvrix_repo), *arguments],
+                    input=input_bytes,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    env=environment,
+                    check=False,
+                )
+
+            if run(["read-tree", evaluator.PINNED_WOLVRIX_COMMIT]).returncode != 0:
+                return "cannot materialize the pinned Wolvrix tree for patch checking"
+            for relative in changed_paths:
+                listed = run(
+                    [
+                        "ls-tree",
+                        "-z",
+                        evaluator.PINNED_WOLVRIX_COMMIT,
+                        "--",
+                        relative,
+                    ]
+                )
+                records = [item for item in listed.stdout.split(b"\0") if item]
+                if listed.returncode != 0 or len(records) != 1:
+                    return "capability patch does not target an existing pinned file"
+                metadata, separator, encoded_path = records[0].partition(b"\t")
+                fields = metadata.split()
+                if (
+                    separator != b"\t"
+                    or encoded_path.decode("utf-8", errors="replace") != relative
+                    or len(fields) != 3
+                    or fields[0] not in {b"100644", b"100755"}
+                    or fields[1] != b"blob"
+                ):
+                    return "capability patch target is not a regular pinned source file"
+            applied = run(
+                ["apply", "--cached", "--whitespace=error-all", "-"],
+                input_bytes=patch.encode("utf-8"),
+            )
+            if applied.returncode != 0:
+                return "capability patch does not apply cleanly to the pinned Wolvrix tree"
+            difference = run(
+                [
+                    "diff-index",
+                    "--cached",
+                    "--quiet",
+                    evaluator.PINNED_WOLVRIX_COMMIT,
+                    "--",
+                ]
+            )
+            if difference.returncode == 0:
+                return "capability patch produces no pinned source change"
+            if difference.returncode != 1:
+                return "cannot verify the pinned source change from the capability patch"
+    except (OSError, UnicodeError):
+        return "cannot check the capability patch against the pinned Wolvrix tree"
+    return None
+
+
+def _validate_preflight_candidate(
+    value: dict[str, Any],
+    trace: Any,
+    *,
+    evaluator: ModuleType,
+    expected_digest: str,
+    target_repo: Path | None = None,
+) -> str | None:
+    """Return a repair-safe reason when a capability response is not usable."""
+    try:
+        candidate = evaluator.parse_candidate_text(
+            json.dumps(value, ensure_ascii=False, sort_keys=True)
+        )
+    except evaluator.CandidateError:
+        return "response is not a valid production GrhSIM candidate"
+    if candidate.is_control or candidate.candidate_mode == "control":
+        return "capability response must not use the control candidate mode"
+    if _PLACEHOLDER_RE.fullmatch(candidate.hypothesis):
+        return "capability response hypothesis is placeholder text"
+    if candidate.hypothesis != PREFLIGHT_SMOKE_HYPOTHESIS:
+        return "capability response did not copy the smoke hypothesis exactly"
+    if any(_PLACEHOLDER_RE.fullmatch(item.strip()) for item in candidate.evidence):
+        return "capability response evidence contains placeholder text"
+    if candidate.patch != PREFLIGHT_SMOKE_PATCH:
+        return "capability response did not copy the deterministic smoke patch exactly"
+    try:
+        changed_paths = evaluator.validate_patch(candidate.patch)
+    except evaluator.CandidateError:
+        return "capability response does not contain a valid safe unified diff"
+    if not changed_paths:
+        return "capability response patch changes no source files"
+    if target_repo is not None:
+        patch_error = _check_pinned_patch(
+            target_repo,
+            evaluator,
+            candidate.patch,
+            changed_paths,
+        )
+        if patch_error is not None:
+            return patch_error
+
+    reported = [
+        item.removeprefix(PREFLIGHT_EVIDENCE_PREFIX)
+        for item in candidate.evidence
+        if item.startswith(PREFLIGHT_EVIDENCE_PREFIX)
+    ]
+    if (
+        len(candidate.evidence) != 1
+        or len(reported) != 1
+        or re.fullmatch(r"[0-9a-f]{64}", reported[0]) is None
+    ):
+        return "capability response must report exactly one lowercase repo attestation"
+    if reported[0] != expected_digest:
+        return "reported repo attestation does not match the fresh pinned-blob challenge"
+    if getattr(trace, "repo_tool_call_count", 0) < 1:
+        return "capability response did not use a repository inspection tool"
+    return None
+
+
 def run_codex_preflight(args: argparse.Namespace) -> int:
-    """Validate the configured Codex provider without creating a research run."""
+    """Run a bounded repository-grounded capability smoke without research."""
     target_repo = args.target_repo.expanduser().resolve()
     if not (target_repo / ".git").exists() or not (target_repo / "env.sh").is_file():
         raise SystemExit(f"not a GrhSIM playground checkout: {target_repo}")
     codex_config = _regular_file(args.codex_config, "Codex config")
     codex_auth = _regular_file(args.codex_auth, "Codex auth")
     schema = _regular_file(TASK_ROOT / "candidate.schema.json", "candidate schema")
+    local_schema = _regular_file(
+        LOCAL_VALIDATION_SCHEMA, "candidate local validation schema"
+    )
+    evaluator = _load_evaluator()
+    preflight_timeout = getattr(
+        args, "preflight_timeout", DEFAULT_PREFLIGHT_TIMEOUT
+    )
+    if (
+        isinstance(preflight_timeout, bool)
+        or not isinstance(preflight_timeout, (int, float))
+        or not 0 < preflight_timeout <= 1_800
+    ):
+        raise SystemExit("preflight timeout must be in (0, 1800] seconds")
+    challenge_nonce = secrets.token_hex(32)
+    expected_digest = _pinned_probe_digest(
+        target_repo, evaluator, challenge_nonce
+    )
 
     from simpletes.llm.codex_exec import CodexExecClient
+    from simpletes.llm.types import LLMCallError
 
-    client = CodexExecClient(
-        model=MODEL,
-        reasoning_effort=REASONING_EFFORT,
-        config_path=str(codex_config),
-        auth_path=str(codex_auth),
-        repo_root=str(target_repo),
-        output_schema=str(schema),
-        timeout=args.llm_timeout,
-    )
     try:
-        asyncio.run(client.preflight())
+        client = CodexExecClient(
+            model=MODEL,
+            reasoning_effort=REASONING_EFFORT,
+            config_path=str(codex_config),
+            auth_path=str(codex_auth),
+            repo_root=str(target_repo),
+            output_schema=str(schema),
+            local_validation_schema=str(local_schema),
+            output_mode="local-json",
+            tool_choice_mode="required-first",
+            timeout=float(preflight_timeout),
+            max_repair_attempts=0,
+        )
+    except ValueError as error:
+        raise SystemExit(
+            f"invalid Codex capability preflight configuration: {error}"
+        ) from None
+    try:
+        prompt = _preflight_prompt(evaluator, challenge_nonce)
+
+        def validate(value: dict[str, Any], trace: Any) -> str | None:
+            return _validate_preflight_candidate(
+                value,
+                trace,
+                evaluator=evaluator,
+                expected_digest=expected_digest,
+                target_repo=target_repo,
+            )
+
+        try:
+            result = asyncio.run(client.capability_probe(prompt, validate=validate))
+        except LLMCallError as error:
+            # The backend message is already bounded and scrubbed against the
+            # loaded auth material and credential-shaped diagnostics.  Keep it
+            # visible so a failed capability gate can be repaired without a
+            # blind second provider call; suppress the exception chain so raw
+            # subprocess/provider payloads still cannot reach a traceback.
+            raise SystemExit(
+                "Codex capability preflight failed "
+                f"({error.error_type}): {error.message}"
+            ) from None
     finally:
         client.close()
-    print(f"Codex preflight passed: model={MODEL}, effort={REASONING_EFFORT}")
+    print(
+        "Codex capability preflight passed: "
+        f"model={MODEL}, effort={REASONING_EFFORT}, "
+        f"repo_tool_calls={result.trace.repo_tool_call_count}, "
+        f"response_chars={len(result.canonical)}, "
+        "response_sha256="
+        f"{hashlib.sha256(result.canonical.encode('utf-8')).hexdigest()}"
+    )
     return 0
 
 
@@ -204,6 +623,9 @@ def build_command(args: argparse.Namespace) -> tuple[list[str], dict[str, str]]:
     codex_config = _regular_file(args.codex_config, "Codex config")
     codex_auth = _regular_file(args.codex_auth, "Codex auth")
     schema = _regular_file(TASK_ROOT / "candidate.schema.json", "candidate schema")
+    local_schema = _regular_file(
+        LOCAL_VALIDATION_SCHEMA, "candidate local validation schema"
+    )
     init_program = _regular_file(args.init_program, "initial program")
     evaluator = _regular_file(TASK_ROOT / "evaluator.py", "evaluator")
     instruction = _regular_file(TASK_ROOT / "instruction.txt", "instruction")
@@ -261,6 +683,12 @@ def build_command(args: argparse.Namespace) -> tuple[list[str], dict[str, str]]:
         str(target_repo),
         "--codex-output-schema",
         str(schema),
+        "--codex-local-validation-schema",
+        str(local_schema),
+        "--codex-output-mode",
+        "local-json",
+        "--codex-tool-choice-mode",
+        "required-first",
         "--model",
         MODEL,
         "--reasoning-effort",
@@ -288,6 +716,10 @@ def build_command(args: argparse.Namespace) -> tuple[list[str], dict[str, str]]:
         "--max-tokens",
         str(args.max_tokens),
         "--disable-reflection",
+        # This launcher performs the stronger repository-grounded capability
+        # gate immediately before spawning main.py.  Do not repeat the generic
+        # backend preflight after an engine process has been created.
+        "--skip-preflight",
         "--log-interval",
         "1",
         "--db-show-interval",
@@ -355,6 +787,15 @@ def main() -> int:
     parser.add_argument("--valid-target", type=int, default=8)
     parser.add_argument("--eval-timeout", type=float, default=21_600.0)
     parser.add_argument("--llm-timeout", type=float, default=3_000.0)
+    parser.add_argument(
+        "--preflight-timeout",
+        type=float,
+        default=DEFAULT_PREFLIGHT_TIMEOUT,
+        help=(
+            "Per-launch deterministic K3 capability-gate timeout; independent "
+            "from the longer research-generation timeout"
+        ),
+    )
     parser.add_argument("--max-tokens", type=int, default=32_768)
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--dry-run", action="store_true")
@@ -371,6 +812,15 @@ def main() -> int:
     if args.dry_run:
         print(shlex.join(command))
         return 0
+    launch_guard = _launch_guard_digest(args, command)
+    run_codex_preflight(args)
+    if not secrets.compare_digest(
+        launch_guard, _launch_guard_digest(args, command)
+    ):
+        raise SystemExit(
+            "SimpleTES launch inputs changed during capability preflight; "
+            "refusing to spawn research"
+        )
     completed = subprocess.run(command, cwd=SIMPLETES_ROOT, env=environment, check=False)
     return int(completed.returncode)
 

@@ -1,4 +1,5 @@
 import asyncio
+import json
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -167,3 +168,92 @@ def test_checkpoint_config_serializes_effective_llm_policy_values(tmp_path):
     assert serialized["context_window"] == 32768
     assert serialized["reasoning_budget"] == 26000
     assert serialized["response_budget"] == 6768
+
+
+def test_checkpoint_config_persists_k3_generation_provenance_without_auth(
+    tmp_path, monkeypatch
+):
+    config = EngineConfig(
+        init_program="init.py",
+        evaluator_path="eval.py",
+        instruction_path="prompt.txt",
+        model="k3",
+        reasoning_effort="ultra",
+        llm_backend="codex_exec",
+        api_key="api-key-must-not-persist",
+        codex_config_path="/safe/config.kimi.toml",
+        codex_auth_path="/secret/auth-path-must-not-persist.json",
+        codex_repo_root="/work/grhsim-repo",
+        codex_output_schema="/work/candidate.schema.json",
+        codex_local_validation_schema="/work/candidate.local.schema.json",
+        codex_output_mode="local-json",
+        codex_tool_choice_mode="required-first",
+        llm_policy_api_key="policy-key-must-not-persist",
+    )
+    manager = CheckpointManager(config, "instance-id", str(tmp_path))
+    monkeypatch.setattr(
+        "simpletes.engine.checkpoint.save_score_statistics",
+        lambda *_args, **_kwargs: None,
+    )
+
+    serialized = manager._config_to_dict()
+    manager.write_sync(
+        best_code=None,
+        metadata={"completed_evaluations": 0, "best_score": 0.0},
+        config=serialized,
+        policy={"name": "rpucg", "state": {}},
+        nodes=[],
+        failure_records=[],
+    )
+
+    config_paths = list(tmp_path.glob("db_state_*/config.json"))
+    assert len(config_paths) == 1
+    on_disk = json.loads(config_paths[0].read_text(encoding="utf-8"))
+    assert on_disk["model"] == "k3"
+    assert on_disk["reasoning_effort"] == "ultra"
+    assert on_disk["llm_backend"] == "codex_exec"
+    assert on_disk["codex_config_path"] == "/safe/config.kimi.toml"
+    assert on_disk["codex_repo_root"] == "/work/grhsim-repo"
+    assert on_disk["codex_output_schema"] == "/work/candidate.schema.json"
+    assert on_disk["codex_local_validation_schema"] == (
+        "/work/candidate.local.schema.json"
+    )
+    assert on_disk["codex_output_mode"] == "local-json"
+    assert on_disk["codex_tool_choice_mode"] == "required-first"
+
+    rendered = json.dumps(on_disk, sort_keys=True)
+    assert "codex_auth_path" not in on_disk
+    assert "api_key" not in on_disk
+    assert "llm_policy_api_key" not in on_disk
+    assert "auth-path-must-not-persist" not in rendered
+    assert "api-key-must-not-persist" not in rendered
+    assert "policy-key-must-not-persist" not in rendered
+
+
+def test_checkpoint_load_accepts_legacy_config_without_codex_provenance(tmp_path):
+    state = tmp_path / "db_state_legacy"
+    state.mkdir()
+    (state / "metadata.json").write_text(
+        json.dumps({"instance_id": "legacy", "completed_evaluations": 0}),
+        encoding="utf-8",
+    )
+    (state / "config.json").write_text(
+        json.dumps({"model": "k3", "llm_backend": "codex_exec"}),
+        encoding="utf-8",
+    )
+    (state / "policy.json").write_text(
+        json.dumps({"name": "balance", "state": {}}),
+        encoding="utf-8",
+    )
+    (state / "nodes.json").write_text("[]\n", encoding="utf-8")
+
+    config = EngineConfig(
+        init_program="init.py",
+        evaluator_path="eval.py",
+        instruction_path="prompt.txt",
+    )
+    manager = CheckpointManager(config, "current", str(tmp_path / "output"))
+    restored = manager.load(str(state), NodeDatabase(), _build_policy("balance"))
+
+    assert restored["instance_id"] == "legacy"
+    assert restored["completed_evaluations"] == 0

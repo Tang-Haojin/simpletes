@@ -282,6 +282,58 @@ def test_model_output_schema_rejects_control_proposals():
     )
 
 
+def test_provider_schema_stays_flat_while_local_overlay_rejects_k3_shapes():
+    schema = json.loads((TASK_ROOT / "candidate.schema.json").read_text(encoding="utf-8"))
+    local_schema = json.loads(
+        (TASK_ROOT / "candidate.local.schema.json").read_text(encoding="utf-8")
+    )
+    Draft202012Validator.check_schema(schema)
+    Draft202012Validator.check_schema(local_schema)
+    provider_validator = Draft202012Validator(schema)
+    local_validator = Draft202012Validator(local_schema)
+    valid = json.loads(evaluator._extract_candidate_payload(_candidate_text()))
+
+    assert list(provider_validator.iter_errors(valid)) == []
+    assert list(local_validator.iter_errors(valid)) == []
+
+    default_path = dict(valid)
+    default_path["candidate_mode"] = "default-path"
+    default_path["enable_options"] = []
+    assert list(provider_validator.iter_errors(default_path)) == []
+    assert list(local_validator.iter_errors(default_path)) == []
+
+    # The production provider has rejected minLength/minItems/pattern and
+    # top-level conditionals in prior real requests. Keep its schema flat and
+    # apply these complete Draft 2020-12 semantics only after the response is
+    # local, where a failure can trigger bounded repair before evaluation.
+    invalid_changes = [
+        ("empty hypothesis", {"hypothesis": ""}),
+        ("whitespace hypothesis", {"hypothesis": " \t"}),
+        ("placeholder hypothesis", {"hypothesis": "placeholder"}),
+        ("case-insensitive placeholder hypothesis", {"hypothesis": "DUMMY."}),
+        ("empty evidence", {"evidence": []}),
+        ("empty evidence item", {"evidence": [""]}),
+        ("placeholder evidence item", {"evidence": [" Placeholder. "]}),
+        ("empty patch", {"patch": ""}),
+        ("placeholder patch without newline", {"patch": "placeholder"}),
+        ("patch without trailing newline", {"patch": VALID_PATCH.rstrip("\n")}),
+        (
+            "default-path with options",
+            {"candidate_mode": "default-path"},
+        ),
+        (
+            "explicit-options without options",
+            {"candidate_mode": "explicit-options", "enable_options": []},
+        ),
+    ]
+
+    for label, changes in invalid_changes:
+        payload = dict(valid)
+        payload.update(changes)
+        assert list(provider_validator.iter_errors(payload)) == [], label
+        assert list(local_validator.iter_errors(payload)), label
+
+
 def test_model_output_schema_uses_provider_compatible_flat_contract():
     schema = json.loads((TASK_ROOT / "candidate.schema.json").read_text(encoding="utf-8"))
     unsupported = {
@@ -295,6 +347,7 @@ def test_model_output_schema_uses_provider_compatible_flat_contract():
         "dependentSchemas",
         "minLength",
         "maxLength",
+        "pattern",
         "minItems",
         "maxItems",
     }
@@ -1903,6 +1956,19 @@ def test_launcher_uses_fixed_model_serial_budget_and_only_secret_file_paths(
     assert "--max-generations 16" in rendered
     assert "--eval-concurrency 1" in rendered
     assert "--gen-concurrency 1" in rendered
+    assert "--skip-preflight" in rendered
+    local_schema_index = command.index("--codex-local-validation-schema")
+    assert command[local_schema_index + 1] == str(
+        launcher.LOCAL_VALIDATION_SCHEMA.resolve()
+    )
+    provider_schema_index = command.index("--codex-output-schema")
+    assert command[provider_schema_index + 1] == str(
+        (TASK_ROOT / "candidate.schema.json").resolve()
+    )
+    output_mode_index = command.index("--codex-output-mode")
+    assert command[output_mode_index + 1] == "local-json"
+    tool_choice_index = command.index("--codex-tool-choice-mode")
+    assert command[tool_choice_index + 1] == "required-first"
     assert command[:2] == ["bash", "-c"]
     assert 'source "$1"' in command[2]
     assert str(target / "env.sh") in command
@@ -2168,6 +2234,338 @@ def test_launcher_cli_defaults_to_dataset_initial_program(monkeypatch, capsys):
     assert capsys.readouterr().out.strip() == "true"
 
 
+def _capability_payload(digest: str) -> dict:
+    payload = json.loads(
+        evaluator._extract_candidate_payload(
+            _candidate_text(
+                options=[],
+                candidate_mode="default-path",
+                evidence=[f"{launcher.PREFLIGHT_EVIDENCE_PREFIX}{digest}"],
+                patch=launcher.PREFLIGHT_SMOKE_PATCH,
+            )
+        )
+    )
+    payload["hypothesis"] = launcher.PREFLIGHT_SMOKE_HYPOTHESIS
+    return payload
+
+
+def test_launcher_probe_digest_reads_the_pinned_tracked_blob(monkeypatch, tmp_path: Path):
+    parent_pin = "1" * 40
+    wolvrix_pin = "2" * 40
+    blob = b"tracked pinned source\n"
+    nonce = "3" * 64
+    calls = []
+
+    def fake_git_bytes(repo, arguments, label):
+        calls.append((repo, arguments, label))
+        if arguments[-1] == f"{parent_pin}^{{commit}}":
+            return f"{parent_pin}\n".encode()
+        if arguments[-1] == f"{parent_pin}:wolvrix":
+            return f"{wolvrix_pin}\n".encode()
+        if arguments[-1] == f"{wolvrix_pin}^{{commit}}":
+            return f"{wolvrix_pin}\n".encode()
+        if arguments[-1] == f"{wolvrix_pin}:{launcher.PREFLIGHT_PROBE_SUBMODULE_PATH}":
+            return blob
+        pytest.fail(f"unexpected git probe: {arguments}")
+
+    monkeypatch.setattr(launcher, "_git_bytes", fake_git_bytes)
+    contract = SimpleNamespace(
+        PINNED_PARENT_COMMIT=parent_pin,
+        PINNED_WOLVRIX_COMMIT=wolvrix_pin,
+    )
+
+    assert launcher._pinned_probe_digest(
+        tmp_path, contract, nonce
+    ) == hashlib.sha256(nonce.encode("ascii") + b"\0" + blob).hexdigest()
+    assert calls[-1][0] == tmp_path / "wolvrix"
+    assert calls[-1][1] == [
+        "show",
+        f"{wolvrix_pin}:{launcher.PREFLIGHT_PROBE_SUBMODULE_PATH}",
+    ]
+
+
+def test_launcher_checks_capability_patch_in_temporary_pinned_index(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "target"
+    wolvrix = target / "wolvrix"
+    source = wolvrix / "lib" / "example.cpp"
+    source.parent.mkdir(parents=True)
+    source.write_text("old\n", encoding="utf-8")
+
+    def git(*arguments: str) -> subprocess.CompletedProcess:
+        return subprocess.run(
+            ["git", "-C", str(wolvrix), *arguments],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=launcher._clean_git_environment(),
+        )
+
+    git("init", "-q")
+    git("config", "user.email", "simpletes-test@example.invalid")
+    git("config", "user.name", "SimpleTES Test")
+    git("add", "lib/example.cpp")
+    git("commit", "-q", "-m", "pinned")
+    pin = git("rev-parse", "HEAD").stdout.decode().strip()
+    contract = SimpleNamespace(PINNED_WOLVRIX_COMMIT=pin)
+    objects = wolvrix / ".git" / "objects"
+    objects_before = {
+        path.relative_to(objects): path.read_bytes()
+        for path in objects.rglob("*")
+        if path.is_file()
+    }
+    refs_before = git("show-ref").stdout
+    index_before = (wolvrix / ".git" / "index").read_bytes()
+    monkeypatch.setenv("GIT_DIR", str(tmp_path / "poisoned-git-dir"))
+    monkeypatch.setenv("GIT_WORK_TREE", str(tmp_path / "poisoned-work-tree"))
+    monkeypatch.setenv("GIT_OBJECT_DIRECTORY", str(tmp_path / "poisoned-objects"))
+
+    assert (
+        launcher._check_pinned_patch(
+            target,
+            contract,
+            VALID_PATCH,
+            ("lib/example.cpp",),
+        )
+        is None
+    )
+    assert source.read_text(encoding="utf-8") == "old\n"
+    objects_after = {
+        path.relative_to(objects): path.read_bytes()
+        for path in objects.rglob("*")
+        if path.is_file()
+    }
+    assert objects_after == objects_before
+    assert git("show-ref").stdout == refs_before
+    assert (wolvrix / ".git" / "index").read_bytes() == index_before
+    assert git("diff", "--quiet").returncode == 0
+    assert git("diff", "--cached", "--quiet").returncode == 0
+
+    stale = VALID_PATCH.replace("-old", "-missing")
+    assert "does not apply cleanly" in launcher._check_pinned_patch(
+        target,
+        contract,
+        stale,
+        ("lib/example.cpp",),
+    )
+
+
+def test_launcher_capability_validator_requires_real_candidate_digest_and_tool_use():
+    digest = "a" * 64
+    trace = SimpleNamespace(repo_tool_call_count=1, repo_tool_types=("shell",))
+    valid = _capability_payload(digest)
+
+    assert (
+        launcher._validate_preflight_candidate(
+            valid,
+            trace,
+            evaluator=evaluator,
+            expected_digest=digest,
+        )
+        is None
+    )
+
+    wrong_digest = _capability_payload("b" * 64)
+    assert "does not match" in launcher._validate_preflight_candidate(
+        wrong_digest,
+        trace,
+        evaluator=evaluator,
+        expected_digest=digest,
+    )
+    assert "did not use" in launcher._validate_preflight_candidate(
+        valid,
+        SimpleNamespace(repo_tool_call_count=0, repo_tool_types=()),
+        evaluator=evaluator,
+        expected_digest=digest,
+    )
+
+    placeholder = dict(valid)
+    placeholder["hypothesis"] = "placeholder"
+    assert "placeholder" in launcher._validate_preflight_candidate(
+        placeholder,
+        trace,
+        evaluator=evaluator,
+        expected_digest=digest,
+    )
+
+    placeholder_evidence = dict(valid)
+    placeholder_evidence["evidence"] = [
+        f"{launcher.PREFLIGHT_EVIDENCE_PREFIX}{digest}",
+        "placeholder",
+    ]
+    assert "evidence contains placeholder" in launcher._validate_preflight_candidate(
+        placeholder_evidence,
+        trace,
+        evaluator=evaluator,
+        expected_digest=digest,
+    )
+
+    invalid_mode_shape = dict(valid)
+    invalid_mode_shape["candidate_mode"] = "explicit-options"
+    assert "not a valid production" in launcher._validate_preflight_candidate(
+        invalid_mode_shape,
+        trace,
+        evaluator=evaluator,
+        expected_digest=digest,
+    )
+
+    invalid_patch = dict(valid)
+    invalid_patch["patch"] = "placeholder\n"
+    assert "not a valid production" in launcher._validate_preflight_candidate(
+        invalid_patch,
+        trace,
+        evaluator=evaluator,
+        expected_digest=digest,
+    )
+
+    missing_newline = dict(valid)
+    missing_newline["patch"] = VALID_PATCH.rstrip("\n")
+    assert "not a valid production" in launcher._validate_preflight_candidate(
+        missing_newline,
+        trace,
+        evaluator=evaluator,
+        expected_digest=digest,
+    )
+
+
+def test_launcher_capability_preflight_is_repo_grounded_and_research_free(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys,
+):
+    target = tmp_path / "target"
+    (target / ".git").mkdir(parents=True)
+    (target / "env.sh").write_text("true\n", encoding="utf-8")
+    config = tmp_path / "config.kimi.toml"
+    auth = tmp_path / "auth.kimi.json"
+    config.write_text("model = 'k3'\n", encoding="utf-8")
+    auth.write_text('{"OPENAI_API_KEY":"not-read-by-fake"}\n', encoding="utf-8")
+    digest = "c" * 64
+    nonce = "e" * 64
+    payload = _capability_payload(digest)
+    captured = {}
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            captured["kwargs"] = kwargs
+            self.closed = False
+
+        async def capability_probe(self, prompt, *, validate=None):
+            captured["prompt"] = prompt
+            trace = SimpleNamespace(repo_tool_call_count=2, repo_tool_types=("shell",))
+            assert validate is not None
+            assert validate(payload, trace) is None
+            return SimpleNamespace(
+                value=payload,
+                trace=trace,
+                canonical=json.dumps(
+                    payload, ensure_ascii=False, sort_keys=True, indent=2
+                ),
+            )
+
+        def close(self):
+            self.closed = True
+            captured["closed"] = True
+
+    import simpletes.llm.codex_exec as codex_exec
+
+    def forbidden(*_args, **_kwargs):
+        pytest.fail("capability preflight must not start research or evaluation")
+
+    monkeypatch.setattr(codex_exec, "CodexExecClient", FakeClient)
+    monkeypatch.setattr(launcher, "_load_evaluator", lambda: evaluator)
+    monkeypatch.setattr(launcher, "_pinned_probe_digest", lambda *_args: digest)
+    monkeypatch.setattr(launcher, "_check_pinned_patch", lambda *_args: None)
+    monkeypatch.setattr(launcher.secrets, "token_hex", lambda _size: nonce)
+    monkeypatch.setattr(launcher, "build_command", forbidden)
+    monkeypatch.setattr(evaluator, "evaluate", forbidden)
+    args = SimpleNamespace(
+        target_repo=target,
+        codex_config=config,
+        codex_auth=auth,
+        preflight_timeout=600.0,
+    )
+
+    assert launcher.run_codex_preflight(args) == 0
+
+    assert captured["closed"] is True
+    assert captured["kwargs"]["output_schema"] == str(
+        (TASK_ROOT / "candidate.schema.json").resolve()
+    )
+    assert captured["kwargs"]["local_validation_schema"] == str(
+        launcher.LOCAL_VALIDATION_SCHEMA.resolve()
+    )
+    assert captured["kwargs"]["output_mode"] == "local-json"
+    assert captured["kwargs"]["tool_choice_mode"] == "required-first"
+    assert captured["kwargs"]["timeout"] == 600.0
+    assert captured["kwargs"]["max_repair_attempts"] == 0
+    assert evaluator.PINNED_WOLVRIX_COMMIT in captured["prompt"]
+    assert launcher.PREFLIGHT_PROBE_SUBMODULE_PATH in captured["prompt"]
+    assert nonce in captured["prompt"]
+    assert digest not in captured["prompt"]
+    assert "This is not performance research" in captured["prompt"]
+    assert "Research the repository deeply" not in captured["prompt"]
+    assert json.dumps(launcher.PREFLIGHT_SMOKE_PATCH) in captured["prompt"]
+    assert not (tmp_path / "checkpoints").exists()
+    output = capsys.readouterr().out
+    assert "capability preflight passed" in output
+    assert "repo_tool_calls=2" in output
+
+
+def test_launcher_capability_failure_includes_backend_scrubbed_diagnostic(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+):
+    from simpletes.llm.types import LLMCallError
+
+    target = tmp_path / "target"
+    (target / ".git").mkdir(parents=True)
+    (target / "env.sh").write_text("true\n", encoding="utf-8")
+    config = tmp_path / "config.kimi.toml"
+    auth = tmp_path / "auth.kimi.json"
+    config.write_text("model = 'k3'\n", encoding="utf-8")
+    auth.write_text('{"OPENAI_API_KEY":"not-read-by-fake"}\n', encoding="utf-8")
+    captured = {}
+
+    class FailingClient:
+        def __init__(self, **_kwargs):
+            pass
+
+        async def capability_probe(self, _prompt, *, validate=None):
+            assert validate is not None
+            raise LLMCallError(
+                model="k3",
+                api_base=None,
+                error_type="SemanticValidationError",
+                message="bounded scrubbed semantic diagnostic",
+            )
+
+        def close(self):
+            captured["closed"] = True
+
+    import simpletes.llm.codex_exec as codex_exec
+
+    monkeypatch.setattr(codex_exec, "CodexExecClient", FailingClient)
+    monkeypatch.setattr(launcher, "_load_evaluator", lambda: evaluator)
+    monkeypatch.setattr(launcher, "_pinned_probe_digest", lambda *_args: "d" * 64)
+    monkeypatch.setattr(launcher.secrets, "token_hex", lambda _size: "f" * 64)
+    args = SimpleNamespace(
+        target_repo=target,
+        codex_config=config,
+        codex_auth=auth,
+        preflight_timeout=600.0,
+    )
+
+    with pytest.raises(SystemExit) as raised:
+        launcher.run_codex_preflight(args)
+
+    message = str(raised.value)
+    assert message == (
+        "Codex capability preflight failed (SemanticValidationError): "
+        "bounded scrubbed semantic diagnostic"
+    )
+    assert captured["closed"] is True
+
+
 def test_launcher_preflight_only_never_builds_research_command(monkeypatch, capsys):
     captured = {}
 
@@ -2175,6 +2573,7 @@ def test_launcher_preflight_only_never_builds_research_command(monkeypatch, caps
         captured["model"] = launcher.MODEL
         captured["config"] = args.codex_config
         captured["auth"] = args.codex_auth
+        captured["timeout"] = args.preflight_timeout
         return 0
 
     def forbidden_build(_args):
@@ -2188,4 +2587,79 @@ def test_launcher_preflight_only_never_builds_research_command(monkeypatch, caps
     assert captured["model"] == "k3"
     assert captured["config"] == Path("~/.codex/config.kimi.toml").expanduser()
     assert captured["auth"] == Path("~/.codex/auth.kimi.json").expanduser()
+    assert captured["timeout"] == launcher.DEFAULT_PREFLIGHT_TIMEOUT
     assert capsys.readouterr().out == ""
+
+
+def test_launcher_normal_entry_gates_before_spawning_main(monkeypatch):
+    calls = []
+
+    def fake_build(_args):
+        calls.append("build")
+        return ["main-command"], {"SAFE": "1"}
+
+    def fake_preflight(_args):
+        calls.append("capability-preflight")
+        return 0
+
+    def fake_run(command, **kwargs):
+        calls.append("spawn")
+        assert command == ["main-command"]
+        assert kwargs["env"] == {"SAFE": "1"}
+        return subprocess.CompletedProcess(command, 0)
+
+    monkeypatch.setattr(launcher, "build_command", fake_build)
+    monkeypatch.setattr(launcher, "run_codex_preflight", fake_preflight)
+    monkeypatch.setattr(
+        launcher, "_launch_guard_digest", lambda _args, _command: "stable"
+    )
+    monkeypatch.setattr(launcher.subprocess, "run", fake_run)
+    monkeypatch.setattr(sys, "argv", ["launcher.py"])
+
+    assert launcher.main() == 0
+    assert calls == ["build", "capability-preflight", "spawn"]
+
+
+def test_launcher_capability_failure_never_spawns_main(monkeypatch):
+    monkeypatch.setattr(launcher, "build_command", lambda _args: (["main"], {}))
+    monkeypatch.setattr(
+        launcher, "_launch_guard_digest", lambda _args, _command: "stable"
+    )
+
+    def fail_gate(_args):
+        raise SystemExit("capability failed")
+
+    def forbidden_spawn(*_args, **_kwargs):
+        pytest.fail("failed capability gate must not spawn SimpleTES main")
+
+    monkeypatch.setattr(launcher, "run_codex_preflight", fail_gate)
+    monkeypatch.setattr(launcher.subprocess, "run", forbidden_spawn)
+    monkeypatch.setattr(sys, "argv", ["launcher.py"])
+
+    with pytest.raises(SystemExit, match="capability failed"):
+        launcher.main()
+
+
+def test_launcher_refuses_spawn_when_inputs_change_during_preflight(monkeypatch):
+    guards = iter(["before", "after"])
+    calls = []
+
+    monkeypatch.setattr(launcher, "build_command", lambda _args: (["main"], {}))
+    monkeypatch.setattr(
+        launcher, "_launch_guard_digest", lambda _args, _command: next(guards)
+    )
+    monkeypatch.setattr(
+        launcher, "run_codex_preflight", lambda _args: calls.append("preflight")
+    )
+    monkeypatch.setattr(
+        launcher.subprocess,
+        "run",
+        lambda *_args, **_kwargs: pytest.fail(
+            "changed launch inputs must never spawn research"
+        ),
+    )
+    monkeypatch.setattr(sys, "argv", ["launcher.py"])
+
+    with pytest.raises(SystemExit, match="changed during capability preflight"):
+        launcher.main()
+    assert calls == ["preflight"]

@@ -383,6 +383,35 @@ def build_parser(*, mode: str = "single") -> argparse.ArgumentParser:
         default=EngineConfig.codex_output_schema,
         help="(codex_exec) JSON Schema constraining the final response",
     )
+    parser.add_argument(
+        "--codex-local-validation-schema",
+        type=str,
+        default=EngineConfig.codex_local_validation_schema,
+        help=(
+            "(codex_exec) Optional additional JSON Schema validated only "
+            "locally after the provider output schema"
+        ),
+    )
+    parser.add_argument(
+        "--codex-output-mode",
+        choices=("provider-structured", "local-json"),
+        default=EngineConfig.codex_output_mode,
+        help=(
+            "(codex_exec) provider-structured sends --output-schema to Codex; "
+            "local-json relies on the JSON-only prompt and validates both schemas "
+            "locally"
+        ),
+    )
+    parser.add_argument(
+        "--codex-tool-choice-mode",
+        choices=("auto", "required-first"),
+        default=EngineConfig.codex_tool_choice_mode,
+        help=(
+            "(codex_exec) auto preserves Codex requests; required-first uses a "
+            "private loopback compatibility proxy to require a tool on the first "
+            "Responses request of each attempt"
+        ),
+    )
     # Resume
     parser.add_argument("--resume", type=str, help="Checkpoint path to resume from")
 

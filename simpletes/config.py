@@ -151,6 +151,9 @@ class EngineConfig:
     codex_auth_path: str | None = None
     codex_repo_root: str | None = None
     codex_output_schema: str | None = None
+    codex_local_validation_schema: str | None = None
+    codex_output_mode: str = "provider-structured"
+    codex_tool_choice_mode: str = "auto"
 
     # Token forcing (vllm_token_forcing backend)
     reasoning_budget: int | None = 32768  # Phase 1 total budget (prompt + reasoning). None = auto from context_window - response_budget
@@ -239,6 +242,9 @@ def build_config_from_args(args: Any) -> EngineConfig:
         codex_auth_path=args.codex_auth_path,
         codex_repo_root=args.codex_repo_root,
         codex_output_schema=args.codex_output_schema,
+        codex_local_validation_schema=args.codex_local_validation_schema,
+        codex_output_mode=args.codex_output_mode,
+        codex_tool_choice_mode=args.codex_tool_choice_mode,
         reflection_mode=not args.disable_reflection,
         output_path=args.output_path,
         log_interval=args.log_interval,
@@ -372,6 +378,10 @@ def examine_args(args, *, mode: str = "single", policies: set[str]) -> None:
         _maybe_warn_path("--codex-auth", getattr(args, "codex_auth_path", None))
         _maybe_warn_path("--codex-repo-root", getattr(args, "codex_repo_root", None))
         _maybe_warn_path("--codex-output-schema", getattr(args, "codex_output_schema", None))
+        _maybe_warn_path(
+            "--codex-local-validation-schema",
+            getattr(args, "codex_local_validation_schema", None),
+        )
 
     # Prompt shaping
     num_insp = getattr(args, "num_inspirations", None)

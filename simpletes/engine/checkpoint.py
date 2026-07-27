@@ -253,7 +253,17 @@ class CheckpointManager:
             "selector": c.selector, "model": c.model,
             "temperature": c.temperature, "max_tokens": c.max_tokens,
             "api_base": c.api_base, "retry": c.retry, "timeout": c.timeout,
+            "reasoning_effort": c.reasoning_effort,
             "llm_backend": c.llm_backend,
+            # Codex generation provenance.  These are non-sensitive paths and
+            # strategy selectors needed to audit or reproduce a continuation.
+            # Deliberately exclude codex_auth_path and every API-key field.
+            "codex_config_path": c.codex_config_path,
+            "codex_repo_root": c.codex_repo_root,
+            "codex_output_schema": c.codex_output_schema,
+            "codex_local_validation_schema": c.codex_local_validation_schema,
+            "codex_output_mode": c.codex_output_mode,
+            "codex_tool_choice_mode": c.codex_tool_choice_mode,
             "context_window": c.context_window,
             "reasoning_budget": c.reasoning_budget,
             "response_budget": c.response_budget,

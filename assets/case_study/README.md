@@ -18,7 +18,7 @@ Pack `n` non-overlapping circles in the unit square to maximise the sum of radii
 
 - **Seed**: uniform grid of equal-radius circles, then shrinks each radius to the minimum centre-to-centre distance.
 - **Evolved**: LP feasibility check over a pre-computed pair-constraint matrix, then `scipy.optimize.differential_evolution` over the placement, with `cvxpy` polishing radii at each candidate.
-- **Result**: matches or exceeds public baselines on both n. Side-by-side plot in [`best_results/combinatorial_construction/circle_packing_in_a_unit_square_n26/`](../../best_results/combinatorial_construction/circle_packing_in_a_unit_square_n26).
+- **Result**: matches or exceeds public baselines on both n. Side-by-side plot in [`best_results/mathematics_discovery/circle_packing_in_a_unit_square_n26/`](../../best_results/mathematics_discovery/circle_packing_in_a_unit_square_n26).
 
 ---
 
@@ -102,4 +102,4 @@ Given a sparse UMI count matrix `X_train` (cells × genes), produce a denoised `
 
 ---
 
-Each evolved program is in [`best_results/<domain>/<task>_best.py`](../../best_results). Each seed is in [`datasets/<family>/<subtask>/init_program.py`](../../datasets). To reproduce, run `main.py` on the same seed — see the [top-level Quickstart](../../README.md#installation--quickstart).
+Each evolved program is in [`best_results/<domain>/<task>/<task>_best.py`](../../best_results). Each seed is in [`datasets/<family>/<subtask>/init_program.py`](../../datasets). To reproduce, run `main.py` on the same seed — see the [top-level Quickstart](../../README.md#installation--quickstart).

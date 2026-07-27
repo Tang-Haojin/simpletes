@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+import hashlib
 import importlib.util
 import json
 import os
@@ -29,6 +30,10 @@ def _load(name: str, path: Path):
 evaluator = _load("_test_grhsim_evaluator", TASK_ROOT / "evaluator.py")
 launcher = _load("_test_grhsim_launcher", TASK_ROOT / "launcher.py")
 retry_runtime = _load("_test_grhsim_retry_runtime", TASK_ROOT / "retry_runtime.py")
+sys.modules.setdefault("evaluator", evaluator)
+materialize_ablation = _load(
+    "_test_grhsim_materialize_ablation", TASK_ROOT / "materialize_ablation.py"
+)
 
 
 VALID_PATCH = """diff --git a/lib/example.cpp b/lib/example.cpp
@@ -110,6 +115,60 @@ def test_ablation_materializer_preserves_checkpoint_patch_and_options(
     assert materialized.enable_options == source.enable_options
     assert materialized.digest == report["digest"]
     assert report["node_id"] == "node-20"
+
+
+def test_ablation_materializer_mechanically_composes_rwa():
+    lines = [f"line {index}\n" for index in range(1, 61)]
+    baseline = "".join(lines)
+
+    def changed(*replacements: tuple[int, str]) -> str:
+        result = list(lines)
+        for line_number, value in replacements:
+            result[line_number - 1] = f"{value}\n"
+        return "".join(result)
+
+    rw_source = changed((10, "RW"))
+    rwf_source = changed((10, "RW"), (30, "F"))
+    rwfa_source = changed((10, "RW"), (30, "F"), (50, "A"))
+
+    def node(gen_id: int, node_id: str, source: str):
+        return {
+            "id": node_id,
+            "gen_id": gen_id,
+            "code": _candidate_text(
+                patch=materialize_ablation._canonical_diff(baseline, source),
+                options=[],
+                candidate_mode="default-path",
+            ),
+        }
+
+    nodes = [
+        node(16, "rw-node", rw_source),
+        node(22, "rwf-node", rwf_source),
+        node(40, "rwfa-node", rwfa_source),
+    ]
+    document, report = materialize_ablation._compose_rwa(
+        nodes,
+        rw_gen=16,
+        rwf_gen=22,
+        rwfa_gen=40,
+        baseline=baseline,
+        label="rwa",
+    )
+
+    candidate = evaluator.parse_candidate_text(document)
+    rwa_source = materialize_ablation._apply_patch(baseline, candidate.patch)
+    expected = changed((10, "RW"), (50, "A"))
+    assert rwa_source == expected
+    assert candidate.candidate_mode == "default-path"
+    assert candidate.enable_options == {}
+    assert report["mode"] == "compose-rwa"
+    assert report["composition"]["rw_plus_a_equals_rwfa_minus_f"] is True
+    assert report["composition"]["rwa_plus_f_equals_rwfa"] is True
+    assert report["composition"]["rwf_plus_a_equals_rwfa"] is True
+    assert report["composition"]["rwa_patch_sha256"] == hashlib.sha256(
+        candidate.patch.encode("utf-8")
+    ).hexdigest()
 
 
 def test_seed_and_schema_are_valid_and_pinned():

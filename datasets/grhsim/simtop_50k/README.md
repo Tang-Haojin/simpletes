@@ -25,15 +25,17 @@ candidate budget.
 
 ## Start fresh, then continue only within the post-RWA pins
 
-The launcher fixes the requested model to `gpt-5.6-sol` with reasoning effort
-`ultra`, uses four RPUCG chains with `k=1`, serial generation/evaluation, stops
+The launcher fixes the requested model to Codex-compatible `k3` with reasoning
+effort `ultra`, uses four RPUCG chains with `k=1`, serial generation/evaluation, stops
 after eight valid generated candidates or sixteen proposals, and disables
 reflection. It sources the target checkout's `env.sh` before executing
 SimpleTES and forces attribution verification, focused tests, and function
 gates on, regardless of inherited shell settings. It passes only the paths of
-the MJY configuration files; their
-contents are copied to the backend's private temporary `CODEX_HOME` and are not
-placed in argv, environment variables, logs, metrics, or checkpoints.
+the Kimi configuration files. The config is copied to the backend's private
+temporary `CODEX_HOME`; the auth file is parsed without being copied, and its
+API key is injected only into the parent Codex process for the active `kimi`
+provider. Generated tool shells inherit neither the key nor unrelated parent
+credentials, and secrets are not placed in argv, logs, metrics, or checkpoints.
 
 The first run after this repin must use the checked-in empty control seed shown
 below. It creates a new pin-derived evaluator slot namespace and a fresh
@@ -45,14 +47,22 @@ baseline and the launcher rejects them fail-closed.
 cd SimpleTES
 source ../wolvrix-playground-gsim-calibrate-5/env.sh
 ./.venv/bin/python datasets/grhsim/simtop_50k/launcher.py --dry-run
+./.venv/bin/python datasets/grhsim/simtop_50k/launcher.py --preflight-only
 ./.venv/bin/python datasets/grhsim/simtop_50k/launcher.py
 ```
+
+`--preflight-only` performs one ephemeral, schema-constrained, read-only Codex
+request and exits. It does not construct the SimpleTES engine, run the evaluator,
+apply a patch, or create a checkpoint/instance. Use it to validate K3 routing and
+credentials without starting a research round. `--dry-run` remains completely
+offline and only prints the future research command.
 
 Defaults:
 
 - target checkout: sibling `wolvrix-playground-gsim-calibrate-5`
-- config: `~/.codex/config.mjy.toml`
-- auth: `~/.codex/auth.mjy.json`
+- model/provider: `k3` / `kimi`, reasoning effort `ultra`
+- config: `~/.codex/config.kimi.toml`
+- auth: `~/.codex/auth.kimi.json`
 - initial program: `datasets/grhsim/simtop_50k/init_program.txt`
 - evaluator slots: `/tmp/simpletes-grhsim-simtop-50k`
 - checkpoints: `SimpleTES/checkpoints/grhsim_simtop_50k/<timestamp>`

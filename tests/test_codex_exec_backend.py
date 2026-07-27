@@ -26,7 +26,11 @@ SCHEMA = {
 def _make_inputs(tmp_path: Path) -> dict[str, Path]:
     config = tmp_path / "source.toml"
     config.write_text(
-        'model = "gpt-5.6-sol"\nmodel_reasoning_effort = "ultra"\n',
+        'model_provider = "OpenAI"\n'
+        'model = "gpt-5.6-sol"\n'
+        'model_reasoning_effort = "ultra"\n'
+        '[model_providers.OpenAI]\n'
+        'name = "OpenAI"\n',
         encoding="utf-8",
     )
     auth = tmp_path / "source-auth.json"
@@ -224,6 +228,69 @@ def test_config_model_and_effort_must_match(tmp_path: Path) -> None:
         _client(paths, model="different-model")
     with pytest.raises(ValueError, match="reasoning-effort mismatch"):
         _client(paths, reasoning_effort="high")
+
+
+def test_custom_provider_receives_credential_override(tmp_path: Path) -> None:
+    paths = _make_inputs(tmp_path)
+    paths["config"].write_text(
+        'model_provider = "kimi"\n'
+        'model = "k3"\n'
+        'model_reasoning_effort = "ultra"\n'
+        '[model_providers.kimi]\n'
+        'name = "kimi"\n'
+        'base_url = "https://provider.example"\n'
+        'wire_api = "responses"\n'
+        'requires_openai_auth = true\n',
+        encoding="utf-8",
+    )
+    _set_fake(paths, response={"schema_version": 1, "patch": ""})
+
+    asyncio.run(_client(paths, model="k3").preflight())
+    record = json.loads(paths["log"].read_text(encoding="utf-8"))
+    args = record["args"]
+
+    assert args[args.index("-m") + 1] == "k3"
+    assert "model_providers.kimi.requires_openai_auth=false" in args
+    assert 'model_providers.kimi.env_key="OPENAI_API_KEY"' in args
+    assert "model_providers.OpenAI.requires_openai_auth=false" not in args
+    assert not record["auth_exists"]
+    assert record["inherited_api_key"] == "unit-test-secret"
+    assert str(paths["auth"]) not in args
+    assert "unit-test-secret" not in json.dumps(args)
+
+
+def test_custom_provider_contract_fails_closed(tmp_path: Path) -> None:
+    paths = _make_inputs(tmp_path)
+    paths["config"].write_text(
+        'model_provider = "kimi"\n'
+        'model = "gpt-5.6-sol"\n'
+        'model_reasoning_effort = "ultra"\n',
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="no matching model_providers.kimi table"):
+        _client(paths)
+
+    paths["config"].write_text(
+        'model_provider = "bad.provider"\n'
+        'model = "gpt-5.6-sol"\n'
+        'model_reasoning_effort = "ultra"\n',
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="bare-key-compatible"):
+        _client(paths)
+
+
+def test_legacy_config_without_provider_uses_openai_fallback(tmp_path: Path) -> None:
+    paths = _make_inputs(tmp_path)
+    paths["config"].write_text(
+        'model = "gpt-5.6-sol"\nmodel_reasoning_effort = "ultra"\n',
+        encoding="utf-8",
+    )
+    _set_fake(paths, response={"schema_version": 1, "patch": ""})
+
+    asyncio.run(_client(paths).preflight())
+    record = json.loads(paths["log"].read_text(encoding="utf-8"))
+    assert "model_providers.OpenAI.requires_openai_auth=false" in record["args"]
 
 
 def test_auth_symbolic_link_is_rejected_before_resolution(tmp_path: Path) -> None:

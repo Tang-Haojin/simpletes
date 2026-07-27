@@ -12,12 +12,12 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import shutil
 import signal
 import stat
 import tempfile
 import tomllib
-import re
 from pathlib import Path
 from typing import Any
 
@@ -29,6 +29,7 @@ from simpletes.llm.types import LLMCallError, LLMResult
 
 _START_MARKER = "# EVOLVE-BLOCK-START"
 _END_MARKER = "# EVOLVE-BLOCK-END"
+_PROVIDER_NAME_PATTERN = re.compile(r"^[A-Za-z0-9_-]+$")
 _SAFE_ENVIRONMENT_KEYS = frozenset(
     {
         "COLORTERM",
@@ -130,6 +131,7 @@ class CodexExecClient:
 
         configured_model = config.get("model")
         configured_effort = config.get("model_reasoning_effort")
+        configured_provider = config.get("model_provider", "OpenAI")
         if configured_model != self.model:
             raise ValueError(
                 "Codex model mismatch between SimpleTES and the selected config "
@@ -140,6 +142,30 @@ class CodexExecClient:
                 "Codex reasoning-effort mismatch between SimpleTES and the selected config "
                 f"({self.reasoning_effort!r} != {configured_effort!r})"
             )
+        if not isinstance(configured_provider, str) or not configured_provider:
+            raise ValueError("Codex config model_provider must be a non-empty string")
+        if _PROVIDER_NAME_PATTERN.fullmatch(configured_provider) is None:
+            raise ValueError(
+                "Codex config model_provider must be a TOML bare-key-compatible name"
+            )
+        providers = config.get("model_providers", {})
+        if not isinstance(providers, dict):
+            raise ValueError("Codex config model_providers must be a table")
+        provider_config = providers.get(configured_provider)
+        # OpenAI is a built-in Codex provider and remains the compatibility
+        # fallback for older configs which omitted model_provider entirely.
+        # Every named custom provider must have an explicit provider table so
+        # the credential override cannot silently target the wrong endpoint.
+        if provider_config is not None and not isinstance(provider_config, dict):
+            raise ValueError(
+                f"Codex config model_providers.{configured_provider} must be a table"
+            )
+        if configured_provider != "OpenAI" and provider_config is None:
+            raise ValueError(
+                "Codex config selected model_provider has no matching "
+                f"model_providers.{configured_provider} table"
+            )
+        self._model_provider = configured_provider
 
         try:
             with self.auth_path.open(encoding="utf-8") as stream:
@@ -264,6 +290,7 @@ class CodexExecClient:
             process_environment = self._safe_environment(codex_home)
             process_environment["OPENAI_API_KEY"] = self._api_key
             safe_path = process_environment.get("PATH", "/usr/bin:/bin")
+            provider_prefix = f"model_providers.{self._model_provider}"
 
             command = [
                 self.codex_binary,
@@ -281,9 +308,9 @@ class CodexExecClient:
                 "-c",
                 f'model_reasoning_effort="{self.reasoning_effort}"',
                 "-c",
-                "model_providers.OpenAI.requires_openai_auth=false",
+                f"{provider_prefix}.requires_openai_auth=false",
                 "-c",
-                'model_providers.OpenAI.env_key="OPENAI_API_KEY"',
+                f'{provider_prefix}.env_key="OPENAI_API_KEY"',
                 "-c",
                 "disable_response_storage=true",
                 "-c",

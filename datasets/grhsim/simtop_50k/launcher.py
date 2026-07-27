@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
 from dataclasses import dataclass
 from datetime import datetime
 import importlib.util
@@ -20,10 +21,10 @@ from typing import Any
 TASK_ROOT = Path(__file__).resolve().parent
 SIMPLETES_ROOT = TASK_ROOT.parents[2]
 DEFAULT_TARGET_REPO = SIMPLETES_ROOT.parent / "wolvrix-playground-gsim-calibrate-5"
-DEFAULT_CODEX_CONFIG = Path("~/.codex/config.mjy.toml").expanduser()
-DEFAULT_CODEX_AUTH = Path("~/.codex/auth.mjy.json").expanduser()
+DEFAULT_CODEX_CONFIG = Path("~/.codex/config.kimi.toml").expanduser()
+DEFAULT_CODEX_AUTH = Path("~/.codex/auth.kimi.json").expanduser()
 DEFAULT_INIT_PROGRAM = TASK_ROOT / "init_program.txt"
-MODEL = "gpt-5.6-sol"
+MODEL = "k3"
 REASONING_EFFORT = "ultra"
 MAX_PROPOSALS = 64
 
@@ -165,6 +166,34 @@ def _regular_file(path: Path, label: str) -> Path:
     if not resolved.is_file():
         raise SystemExit(f"{label} must be a regular file: {resolved}")
     return resolved
+
+
+def run_codex_preflight(args: argparse.Namespace) -> int:
+    """Validate the configured Codex provider without creating a research run."""
+    target_repo = args.target_repo.expanduser().resolve()
+    if not (target_repo / ".git").exists() or not (target_repo / "env.sh").is_file():
+        raise SystemExit(f"not a GrhSIM playground checkout: {target_repo}")
+    codex_config = _regular_file(args.codex_config, "Codex config")
+    codex_auth = _regular_file(args.codex_auth, "Codex auth")
+    schema = _regular_file(TASK_ROOT / "candidate.schema.json", "candidate schema")
+
+    from simpletes.llm.codex_exec import CodexExecClient
+
+    client = CodexExecClient(
+        model=MODEL,
+        reasoning_effort=REASONING_EFFORT,
+        config_path=str(codex_config),
+        auth_path=str(codex_auth),
+        repo_root=str(target_repo),
+        output_schema=str(schema),
+        timeout=args.llm_timeout,
+    )
+    try:
+        asyncio.run(client.preflight())
+    finally:
+        client.close()
+    print(f"Codex preflight passed: model={MODEL}, effort={REASONING_EFFORT}")
+    return 0
 
 
 def build_command(args: argparse.Namespace) -> tuple[list[str], dict[str, str]]:
@@ -327,9 +356,17 @@ def main() -> int:
     parser.add_argument("--eval-timeout", type=float, default=21_600.0)
     parser.add_argument("--llm-timeout", type=float, default=3_000.0)
     parser.add_argument("--max-tokens", type=int, default=32_768)
-    parser.add_argument("--dry-run", action="store_true")
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--dry-run", action="store_true")
+    mode.add_argument(
+        "--preflight-only",
+        action="store_true",
+        help="Validate K3/provider/auth/schema and exit without creating a research run",
+    )
     args = parser.parse_args()
 
+    if args.preflight_only:
+        return run_codex_preflight(args)
     command, environment = build_command(args)
     if args.dry_run:
         print(shlex.join(command))

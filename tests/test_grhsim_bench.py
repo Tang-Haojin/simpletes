@@ -1875,9 +1875,9 @@ def test_launcher_uses_fixed_model_serial_budget_and_only_secret_file_paths(
     target = tmp_path / "target"
     (target / ".git").mkdir(parents=True)
     (target / "env.sh").write_text("true\n", encoding="utf-8")
-    config = tmp_path / "config.mjy.toml"
-    auth = tmp_path / "auth.mjy.json"
-    config.write_text("model_provider = 'mjy'\n", encoding="utf-8")
+    config = tmp_path / "config.kimi.toml"
+    auth = tmp_path / "auth.kimi.json"
+    config.write_text("model_provider = 'kimi'\n", encoding="utf-8")
     auth.write_text('{"OPENAI_API_KEY":"do-not-leak"}\n', encoding="utf-8")
     args = SimpleNamespace(
         target_repo=target,
@@ -1897,7 +1897,7 @@ def test_launcher_uses_fixed_model_serial_budget_and_only_secret_file_paths(
     rendered = " ".join(command)
 
     assert "--llm-backend codex_exec" in rendered
-    assert "--model gpt-5.6-sol" in rendered
+    assert "--model k3" in rendered
     assert "--reasoning-effort ultra" in rendered
     assert "--max-valid-evaluations 8" in rendered
     assert "--max-generations 16" in rendered
@@ -2154,6 +2154,8 @@ def test_launcher_cli_defaults_to_dataset_initial_program(monkeypatch, capsys):
 
     def fake_build_command(args):
         captured["init_program"] = args.init_program
+        captured["codex_config"] = args.codex_config
+        captured["codex_auth"] = args.codex_auth
         return ["true"], {}
 
     monkeypatch.setattr(launcher, "build_command", fake_build_command)
@@ -2161,4 +2163,29 @@ def test_launcher_cli_defaults_to_dataset_initial_program(monkeypatch, capsys):
 
     assert launcher.main() == 0
     assert captured["init_program"] == launcher.DEFAULT_INIT_PROGRAM
+    assert captured["codex_config"] == Path("~/.codex/config.kimi.toml").expanduser()
+    assert captured["codex_auth"] == Path("~/.codex/auth.kimi.json").expanduser()
     assert capsys.readouterr().out.strip() == "true"
+
+
+def test_launcher_preflight_only_never_builds_research_command(monkeypatch, capsys):
+    captured = {}
+
+    def fake_preflight(args):
+        captured["model"] = launcher.MODEL
+        captured["config"] = args.codex_config
+        captured["auth"] = args.codex_auth
+        return 0
+
+    def forbidden_build(_args):
+        pytest.fail("preflight-only must not construct a research command")
+
+    monkeypatch.setattr(launcher, "run_codex_preflight", fake_preflight)
+    monkeypatch.setattr(launcher, "build_command", forbidden_build)
+    monkeypatch.setattr(sys, "argv", ["launcher.py", "--preflight-only"])
+
+    assert launcher.main() == 0
+    assert captured["model"] == "k3"
+    assert captured["config"] == Path("~/.codex/config.kimi.toml").expanduser()
+    assert captured["auth"] == Path("~/.codex/auth.kimi.json").expanduser()
+    assert capsys.readouterr().out == ""

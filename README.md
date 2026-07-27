@@ -22,7 +22,7 @@
   <img src="assets/simpletes-overview.png" alt="SimpleTES test-time scaling overview" width="900">
 </p>
 
-**SimpleTES** (Simple Test-time Evaluation-driven Scaling) scales the propose → evaluate → refine loop for scientific discovery. It combines parallel exploration, feedback-driven refinement, and local selection. A single open-source `gpt-oss` model reaches state-of-the-art results on 28 problems across five domains, beating both frontier models and tuned optimization pipelines.
+**SimpleTES** (Simple Test-time Evaluation-driven Scaling) scales the propose → evaluate → refine loop for scientific discovery. It combines parallel exploration, feedback-driven refinement, and local selection. A single open-source `gpt-oss` model reaches state-of-the-art results across 28 open-ended problems in five scientific domains, beating both frontier models and tuned optimization pipelines.
 
 ## Updates
 
@@ -30,17 +30,16 @@
 
 ## Highlight Results
 
-| Domain | Problems | Highlights | Released artifacts |
-|--------|:--------:|------------|--------------------|
-| Quantum compilation | 2 | Superconducting qubit routing and zoned neutral-atom compilation | [`quantum_circuit_compilation/`](best_results/quantum_circuit_compilation) |
-| Astrodynamics | 5 | Gravity-assist trajectory design for Mariner 10, Voyager 2, Galileo, Cassini, and Rosetta | Not included in the current code release |
-| Scientific algorithms | 7 | LASSO path solving, whole-brain forecasting at five horizons, and single-cell RNA denoising | [`algorithm_engineering/`](best_results/algorithm_engineering), [`data_science/`](best_results/data_science) |
-| AI foundations | 7 | TriMul, batched cumulative sum, asymmetric matrix multiplication, and four scaling-law discovery problems | [`gpu_kernel_optimization/`](best_results/gpu_kernel_optimization), [`data_science/`](best_results/data_science) |
-| Mathematics discovery | 7 | Erdős minimum overlap, the second and third autocorrelation inequalities, sum-difference, circle packing, and Hadamard determinant | [`mathematics_extremal_analysis/`](best_results/mathematics_extremal_analysis), [`combinatorial_construction/`](best_results/combinatorial_construction) |
+| Domain | Representative problems |
+|--------|-------------------------|
+| Quantum compilation | Superconducting qubit routing and zoned neutral-atom compilation |
+| Astrodynamics | Gravity-assist trajectory design |
+| Scientific algorithms | LASSO path solving, whole-brain forecasting, and single-cell RNA denoising |
+| AI foundations | GPU kernel optimization and scaling-law discovery |
+| Mathematics discovery | Extremal analysis and combinatorial construction |
 
-Each ZAPBench forecasting horizon (`H=1,4,8,16,32`) is counted as a separate problem in the 28-problem benchmark. The public repository currently contains 21 task packages and their released artifacts; astrodynamics and ZAPBench are represented in the benchmark results but are not yet included in `datasets/` or `best_results/`. AHC039, AHC058, and the first autocorrelation inequality remain useful additional released tasks outside the core 28-problem benchmark.
-
-- Full inventory of the 21 currently released artifacts: [`best_results/README.md`](best_results/README.md).
+- **Task catalogue and design guide**: [`datasets/README.md`](datasets/README.md).
+- **Released result artifacts**: [`best_results/README.md`](best_results/README.md).
 - **Case studies** — what each task's seed program evolved into, with side-by-side animations: [`assets/case_study/README.md`](assets/case_study/README.md).
 
 ## How It Works
@@ -157,7 +156,7 @@ uv run python main.py --resume checkpoints/<date>/instance-<id>
 
 ## Build Your Own Task
 
-The current public package ships with 21 tasks across 12 task families. A new task is three files:
+Task implementations are organized by family under [`datasets/`](datasets). A new task is three files:
 
 ```text
 my_family/

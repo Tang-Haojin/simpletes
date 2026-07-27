@@ -68,20 +68,6 @@ class Task:
 
 
 _INIT_EXTS = ("py", "rs", "cpp")
-_INSTRUCTION_EXTS = ("txt", "triton", "cuda")
-
-
-def _find_instruction(subtask_dir: Path) -> Optional[Path]:
-    """Return the task instruction, including code-as-spec kernel tasks."""
-    subtask = subtask_dir.name
-    for ext in _INSTRUCTION_EXTS:
-        preferred = subtask_dir / f"{subtask}.{ext}"
-        if preferred.exists():
-            return preferred
-        matches = sorted(subtask_dir.glob(f"*.{ext}"))
-        if matches:
-            return matches[0]
-    return None
 
 
 def discover_tasks() -> List[Task]:
@@ -99,9 +85,12 @@ def discover_tasks() -> List[Task]:
         if not evaluator.exists():
             continue
 
-        instruction = _find_instruction(subtask_dir)
-        if instruction is None:
-            continue
+        instruction = subtask_dir / f"{subtask}.txt"
+        if not instruction.exists():
+            txts = sorted(subtask_dir.glob("*.txt"))
+            if not txts:
+                continue
+            instruction = txts[0]
 
         needs_setup, hint = _check_setup(family)
         tasks.append(Task(family, subtask, init_path, evaluator, instruction, needs_setup, hint))

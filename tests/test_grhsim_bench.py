@@ -16,6 +16,8 @@ from jsonschema import Draft202012Validator
 
 ROOT = Path(__file__).resolve().parents[1]
 TASK_ROOT = ROOT / "datasets" / "grhsim" / "simtop_50k"
+OLD_PRE_RWA_PARENT_COMMIT = "fbe4e1cbbfcf45b52960545377020cb761c3ab25"
+OLD_PRE_RWA_WOLVRIX_COMMIT = "8f6ba14397b0c3d00cb909153af1c6464f4f1ed9"
 
 
 def _load(name: str, path: Path):
@@ -153,6 +155,7 @@ def test_ablation_materializer_mechanically_composes_rwa():
         rwf_gen=22,
         rwfa_gen=40,
         baseline=baseline,
+        baseline_wolvrix_commit="synthetic-test-baseline",
         label="rwa",
     )
 
@@ -163,12 +166,47 @@ def test_ablation_materializer_mechanically_composes_rwa():
     assert candidate.candidate_mode == "default-path"
     assert candidate.enable_options == {}
     assert report["mode"] == "compose-rwa"
+    assert report["baseline_wolvrix_commit"] == "synthetic-test-baseline"
     assert report["composition"]["rw_plus_a_equals_rwfa_minus_f"] is True
     assert report["composition"]["rwa_plus_f_equals_rwfa"] is True
     assert report["composition"]["rwf_plus_a_equals_rwfa"] is True
     assert report["composition"]["rwa_patch_sha256"] == hashlib.sha256(
         candidate.patch.encode("utf-8")
     ).hexdigest()
+
+
+def test_ablation_materializer_reads_frozen_historical_rwa_baseline(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    calls = []
+
+    def fake_run(command, **kwargs):
+        calls.append((command, kwargs))
+        return subprocess.CompletedProcess(
+            command, 0, stdout=b"historical source\n", stderr=b""
+        )
+
+    monkeypatch.setattr(materialize_ablation.subprocess, "run", fake_run)
+
+    source = materialize_ablation._historical_rwa_source(Path("/wolvrix"))
+
+    assert source == "historical source\n"
+    assert materialize_ablation.HISTORICAL_RWA_BASELINE_WOLVRIX_COMMIT == (
+        "8f6ba14397b0c3d00cb909153af1c6464f4f1ed9"
+    )
+    assert calls == [
+        (
+            [
+                "git",
+                "-C",
+                "/wolvrix",
+                "show",
+                "8f6ba14397b0c3d00cb909153af1c6464f4f1ed9:"
+                "lib/emit/grhsim_cpp.cpp",
+            ],
+            {"capture_output": True, "check": False},
+        )
+    ]
 
 
 def test_seed_and_schema_are_valid_and_pinned():
@@ -180,6 +218,12 @@ def test_seed_and_schema_are_valid_and_pinned():
 
     assert candidate.is_control
     assert candidate.candidate_mode == "control"
+    assert candidate.patch == ""
+    assert candidate.enable_options == {}
+    assert any("Native R lowers" in item for item in candidate.evidence)
+    assert any("Native W cold-hints" in item for item in candidate.evidence)
+    assert any("Native A nests" in item for item in candidate.evidence)
+    assert any("MemoryFill F tier is not present" in item for item in candidate.evidence)
     assert schema["properties"]["schema_version"]["const"] == 2
     assert schema["properties"]["candidate_mode"]["enum"] == [
         "default-path",
@@ -209,8 +253,14 @@ def test_seed_and_schema_are_valid_and_pinned():
     ) == {
         "WOLVRIX_XS_GRHSIM_COMMIT_EXACT_EVENT_POLICY": "targeted-cold-layout"
     }
-    assert evaluator.PINNED_PARENT_COMMIT.startswith("fbe4e1c")
-    assert evaluator.PINNED_WOLVRIX_COMMIT.startswith("8f6ba14")
+    assert evaluator.PINNED_PARENT_COMMIT == (
+        "d31118bea0feb563ad09476e1419f0f15aaf574f"
+    )
+    assert evaluator.PINNED_WOLVRIX_COMMIT == (
+        "16a9f493687a21a5428f1e1327a69834ea60c9f5"
+    )
+    assert evaluator.PINNED_PARENT_COMMIT != OLD_PRE_RWA_PARENT_COMMIT
+    assert evaluator.PINNED_WOLVRIX_COMMIT != OLD_PRE_RWA_WOLVRIX_COMMIT
 
 
 def test_model_output_schema_rejects_control_proposals():
@@ -1962,7 +2012,7 @@ def test_launcher_rejects_symlinked_explicit_initial_seed(tmp_path: Path):
         launcher.build_command(args)
 
 
-def test_launcher_rejects_legacy_seed_and_wrong_pin_checkpoint(tmp_path: Path):
+def test_launcher_rejects_legacy_seed_and_pre_rwa_best_program(tmp_path: Path):
     target = tmp_path / "target"
     (target / ".git").mkdir(parents=True)
     (target / "env.sh").write_text("true\n", encoding="utf-8")
@@ -1993,13 +2043,19 @@ def test_launcher_rejects_legacy_seed_and_wrong_pin_checkpoint(tmp_path: Path):
         launcher.build_command(args)
 
     wrong_pin = tmp_path / "old" / "db_state_010203" / "best_program.txt"
-    _write_v2_checkpoint_seed(wrong_pin, pin_override=("a" * 12, "b" * 12))
+    _write_v2_checkpoint_seed(
+        wrong_pin,
+        pin_override=(
+            OLD_PRE_RWA_PARENT_COMMIT[:12],
+            OLD_PRE_RWA_WOLVRIX_COMMIT[:12],
+        ),
+    )
     args.init_program = wrong_pin
     with pytest.raises(SystemExit, match="evaluator pins differ"):
         launcher.build_command(args)
 
 
-def test_launcher_rejects_legacy_or_wrong_pin_resume(tmp_path: Path):
+def test_launcher_rejects_legacy_or_pre_rwa_resume(tmp_path: Path):
     target = tmp_path / "target"
     (target / ".git").mkdir(parents=True)
     (target / "env.sh").write_text("true\n", encoding="utf-8")
@@ -2009,7 +2065,13 @@ def test_launcher_rejects_legacy_or_wrong_pin_resume(tmp_path: Path):
     auth.write_text("{}\n", encoding="utf-8")
     state = tmp_path / "instance" / "db_state_010203"
     best = state / "best_program.txt"
-    _write_v2_checkpoint_seed(best, pin_override=("a" * 12, "b" * 12))
+    _write_v2_checkpoint_seed(
+        best,
+        pin_override=(
+            OLD_PRE_RWA_PARENT_COMMIT[:12],
+            OLD_PRE_RWA_WOLVRIX_COMMIT[:12],
+        ),
+    )
     args = SimpleNamespace(
         target_repo=target,
         codex_config=config,

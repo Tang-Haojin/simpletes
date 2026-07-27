@@ -11,12 +11,15 @@ from pathlib import Path
 import subprocess
 import tempfile
 
-from evaluator import PINNED_WOLVRIX_COMMIT, parse_candidate_text, validate_patch
+from evaluator import parse_candidate_text, validate_patch
 
 
 START_MARKER = "# EVOLVE-BLOCK-START"
 END_MARKER = "# EVOLVE-BLOCK-END"
 SOURCE_PATH = "lib/emit/grhsim_cpp.cpp"
+HISTORICAL_RWA_BASELINE_WOLVRIX_COMMIT = (
+    "8f6ba14397b0c3d00cb909153af1c6464f4f1ed9"
+)
 
 
 def _parse_args() -> argparse.Namespace:
@@ -37,7 +40,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--wolvrix-repo",
         type=Path,
-        help="Wolvrix repository containing the evaluator-pinned source object",
+        help="Wolvrix repository containing the historical RWA baseline object",
     )
     parser.add_argument("--label", required=True)
     parser.add_argument("--output", type=Path, required=True)
@@ -129,6 +132,7 @@ def _compose_rwa(
     rwf_gen: int,
     rwfa_gen: int,
     baseline: str,
+    baseline_wolvrix_commit: str,
     label: str,
 ) -> tuple[str, dict[str, object]]:
     rw_node, rw_candidate = _checkpoint_candidate(nodes, rw_gen)
@@ -216,27 +220,28 @@ def _compose_rwa(
         "digest": candidate.digest,
         "label": label,
         "mode": "compose-rwa",
+        "baseline_wolvrix_commit": baseline_wolvrix_commit,
         "source_nodes": source_rows,
         "composition": composition,
     }
     return document, report
 
 
-def _pinned_source(wolvrix_repo: Path) -> str:
+def _historical_rwa_source(wolvrix_repo: Path) -> str:
     completed = subprocess.run(
         [
             "git",
             "-C",
             str(wolvrix_repo),
             "show",
-            f"{PINNED_WOLVRIX_COMMIT}:{SOURCE_PATH}",
+            f"{HISTORICAL_RWA_BASELINE_WOLVRIX_COMMIT}:{SOURCE_PATH}",
         ],
         capture_output=True,
         check=False,
     )
     if completed.returncode != 0:
         detail = completed.stderr.decode("utf-8", errors="replace").strip()
-        raise ValueError(f"cannot read evaluator-pinned Wolvrix source: {detail}")
+        raise ValueError(f"cannot read historical RWA Wolvrix source: {detail}")
     return completed.stdout.decode("utf-8")
 
 
@@ -296,7 +301,8 @@ def main() -> int:
                 rw_gen=args.compose_rwa[0],
                 rwf_gen=args.compose_rwa[1],
                 rwfa_gen=args.compose_rwa[2],
-                baseline=_pinned_source(args.wolvrix_repo),
+                baseline=_historical_rwa_source(args.wolvrix_repo),
+                baseline_wolvrix_commit=HISTORICAL_RWA_BASELINE_WOLVRIX_COMMIT,
                 label=args.label,
             )
         else:

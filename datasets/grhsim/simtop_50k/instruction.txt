@@ -11,6 +11,15 @@ walltime. Cycles, instructions, generated-source size, ELF sections, BAE, DAG
 edges, PMU counters, and profiles are diagnostic evidence only. A change is
 useful only if the fixed-ASLR, functionally equivalent end-to-end run improves.
 
+This is the fresh post-RWA baseline at parent
+`d31118bea0feb563ad09476e1419f0f15aaf574f` and Wolvrix
+`16a9f493687a21a5428f1e1327a69834ea60c9f5`. R (cold register-guard
+admission and group hints), W (singleton MemoryWritePort hints inside an
+R-admitted run), and A (adjacent SystemTask plus `xs_assert_v2` outer-guard
+nesting) are already native-default behavior. Do not propose, reconstruct, or
+claim any of R/W/A again. The MemoryFill F tier did not land and is also a
+closed prior direction; do not repropose it. Research a distinct mechanism.
+
 Return exactly one JSON object matching `candidate.schema.json`. The backend
 will place it between the EVOLVE-BLOCK markers. Its fields mean:
 
@@ -21,7 +30,8 @@ will place it between the EVOLVE-BLOCK markers. Its fields mean:
 - `evidence`: repository paths plus absolute observed counts/timings/profile
   facts that motivated this candidate. Never invent measurements.
 - `patch`: a complete `git diff`-style unified diff relative to
-  `wolvrix@8f6ba14`. It must end with a newline.
+  `wolvrix@16a9f493687a21a5428f1e1327a69834ea60c9f5`. It must end with a
+  newline.
 - `enable_options`: an array of `{ "name": snake_case, "value": ... }` entries.
   It must be empty for `default-path` and non-empty for `explicit-options`.
   Names map to `WOLVRIX_XS_GRHSIM_<UPPER_CASE_NAME>` and must be members of the
@@ -74,8 +84,14 @@ Hard constraints:
    It rejects invalid infrastructure samples rather than treating them as a
    performance result.
 6. Prefer a small, attributable candidate. Do not bundle unrelated ideas.
+7. Treat the landed R/W/A implementation and the rejected F MemoryFill tier as
+   immutable baseline history. A patch that repeats any of them is invalid,
+   even if it renames the policy or moves the same logic elsewhere.
 
-The initial program is either the schema-v2 special no-op `control` or a
-previously evaluated schema-v2 best candidate supplied for a fresh continuation
-run. Regardless of the seed, every newly generated candidate must contain a
-non-empty patch and select exactly one of the two non-control modes above.
+The first program in this post-RWA namespace is the schema-v2 special no-op
+`control`. A later fresh continuation may use a previously evaluated best
+candidate only when its checkpoint records these exact new parent/Wolvrix
+pins. Never resume from or seed with a pre-RWA `fbe4e1c`/`8f6ba14` checkpoint;
+it is relative to a different baseline. Regardless of the valid seed, every
+newly generated candidate must contain a non-empty patch and select exactly one
+of the two non-control modes above.

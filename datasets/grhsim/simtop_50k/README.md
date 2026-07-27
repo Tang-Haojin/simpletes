@@ -3,11 +3,18 @@
 This bench evolves a schema-v2 structured JSON candidate whose payload is a
 safe unified diff against the pinned `wolvrix` revision and whose
 `candidate_mode` declares its attribution path. The evaluator never edits the
-user checkout: it creates a locked local clone, verifies parent `fbe4e1c` and
-`wolvrix` `8f6ba14`, applies the patch only inside that slot, runs the
+user checkout: it creates a locked local clone, verifies parent `d31118b` and
+`wolvrix` `16a9f49`, applies the patch only inside that slot, runs the
 mode-specific generated-source attribution gates, builds a real local ELF,
 runs fixed-ASLR function gates, and hands resolved artifacts to the trusted
 runtime.
+
+This pin pair is the fresh post-RWA control namespace. Native defaults already
+contain R (cold register-write guard admission/group hints), W (singleton
+memory-write hints only inside an R-admitted run), and A (eligible adjacent
+SystemTask/`xs_assert_v2` outer-guard nesting). The MemoryFill F tier did not
+land. R/W/A must not be rediscovered or claimed by a candidate, and F is a
+closed prior direction that must not be reproposed.
 
 The score is `control_mean_walltime_ms / candidate_mean_walltime_ms`. Absolute
 control and candidate `Host time spent` values and their millisecond/percentage
@@ -16,7 +23,7 @@ data are diagnostics, not substitute objectives. Retryable host-load or audit
 failures are retried as the same candidate and do not count toward the valid
 candidate budget.
 
-## Start, resume, or continue from the best candidate
+## Start fresh, then continue only within the post-RWA pins
 
 The launcher fixes the requested model to `gpt-5.6-sol` with reasoning effort
 `ultra`, uses four RPUCG chains with `k=1`, serial generation/evaluation, stops
@@ -27,6 +34,12 @@ gates on, regardless of inherited shell settings. It passes only the paths of
 the MJY configuration files; their
 contents are copied to the backend's private temporary `CODEX_HOME` and are not
 placed in argv, environment variables, logs, metrics, or checkpoints.
+
+The first run after this repin must use the checked-in empty control seed shown
+below. It creates a new pin-derived evaluator slot namespace and a fresh
+checkpoint instance. Do not migrate, copy, resume, or seed from the old
+`fbe4e1c`/`8f6ba14` namespace; those candidates are diffs against a different
+baseline and the launcher rejects them fail-closed.
 
 ```bash
 cd SimpleTES
@@ -44,33 +57,37 @@ Defaults:
 - evaluator slots: `/tmp/simpletes-grhsim-simtop-50k`
 - checkpoints: `SimpleTES/checkpoints/grhsim_simtop_50k/<timestamp>`
 
-Use `--resume CHECKPOINT`, and keep the same target/slot roots, to continue a
-gracefully stopped schema-v2 run within its original proposal budget. The
-launcher resolves and validates one exact `db_state_*` plus its exact
+After a new-pin run exists, use `--resume CHECKPOINT`, and keep the same
+target/slot roots, to continue a gracefully stopped schema-v2 run within its
+original proposal budget. The launcher resolves and validates one exact
+`db_state_*` plus its exact
 `best_program.*`, then passes those paths to SimpleTES; it does not perform a
 second "latest checkpoint" selection and no repeated `--init-program` is
 needed. The launcher rejects legacy-schema seeds and resumes, and rejects a
 checkpoint whose recorded evaluator metrics use different parent/wolvrix pins.
+In particular, an old pre-RWA checkpoint is rejected for both `--resume` and
+explicit `best_program.txt` seeding.
 
 ```bash
 ./.venv/bin/python datasets/grhsim/simtop_50k/launcher.py \
-  --resume checkpoints/grhsim_simtop_50k/<run>/<date>/instance-<id>
+  --resume checkpoints/grhsim_simtop_50k/<post-rwa-run>/<date>/instance-<id>
 ```
 
-Once a run has exhausted its proposal budget, start a new instance seeded by
-the previous instance's `best_program.txt` instead of trying to enlarge the old
-checkpoint's chain budgets:
+Once a post-RWA run has exhausted its proposal budget, start a new instance
+seeded by that same-pin instance's `best_program.txt` instead of trying to
+enlarge the checkpoint's chain budgets:
 
 ```bash
 ./.venv/bin/python datasets/grhsim/simtop_50k/launcher.py \
-  --init-program checkpoints/grhsim_simtop_50k/<run>/<date>/instance-<id>/db_state_<time>/best_program.txt
+  --init-program checkpoints/grhsim_simtop_50k/<post-rwa-run>/<date>/instance-<id>/db_state_<time>/best_program.txt
 ```
 
 The seed must be a regular, non-symlink file containing a complete marked
 schema-v2 candidate document. A checkpoint `best_program.txt` seed must also
 match a sibling node whose recorded parent/wolvrix pins equal this evaluator's
-pins. It is evaluated again as the new instance's initial node;
-that initial evaluation does not consume a proposal or valid-candidate slot.
+new `d31118b`/`16a9f49` pins. It is evaluated again as the new instance's
+initial node; that initial evaluation does not consume a proposal or
+valid-candidate slot.
 Omit `--resume` for this continuation so the launcher creates a fresh checkpoint
 instance with a fresh bounded search budget. Build/perf/staging/checkpoint
 artifacts are deliberately untracked.
@@ -82,7 +99,7 @@ at or below the proposal budget. For example, a doubled search uses:
 ```bash
 GRHSIM_INFRA_RETRIES=4 \
 ./.venv/bin/python datasets/grhsim/simtop_50k/launcher.py \
-  --init-program checkpoints/grhsim_simtop_50k/<run>/<date>/instance-<id>/db_state_<time>/best_program.txt \
+  --init-program checkpoints/grhsim_simtop_50k/<post-rwa-run>/<date>/instance-<id>/db_state_<time>/best_program.txt \
   --max-proposals 32 \
   --valid-target 16 \
   --llm-timeout 5400
@@ -156,6 +173,14 @@ active-mask gap packing. It does not control exact event/commit behavior and
 must not be borrowed as a generic optimization gate. That independent mechanism
 uses `commit_exact_event_policy`; refinements to behavior already selected by
 the native C++ default belong in `default-path` mode.
+
+The landed R/W/A source is part of that native control, not candidate space.
+The unlanded F MemoryFill tier is closed as well. Do not submit any candidate
+that recreates R, W, A, or F under another patch shape or option. The
+`materialize_ablation.py --compose-rwa` path remains pinned to historical
+Wolvrix `8f6ba14` solely to reproduce prior ablation evidence; it does not
+define the current evaluator baseline and its output must not seed this
+namespace.
 
 The runtime performs a quiet, dynamically selected CCD-local ABBA 50k screen
 with ASLR disabled. A positive screen is repeated in reversed BAAB order before

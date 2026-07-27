@@ -2,9 +2,13 @@
 {
   "schema_version": 2,
   "candidate_mode": "control",
-  "hypothesis": "Pinned current-default control with no source modification.",
+  "hypothesis": "Pinned post-RWA native-default control with no source modification or option override.",
   "evidence": [
-    "This seed establishes the native-default control baseline at parent fbe4e1c and wolvrix 8f6ba14."
+    "This fresh control pins parent d31118bea0feb563ad09476e1419f0f15aaf574f and wolvrix 16a9f493687a21a5428f1e1327a69834ea60c9f5.",
+    "Native R lowers cold register-guard admission to 256 singleton guards or 2048 eligible writes with a 2048-write group cap and known-nonzero exclusion.",
+    "Native W cold-hints only singleton MemoryWritePort guards inside an R-admitted run; memory writes do not admit a run.",
+    "Native A nests an eligible adjacent SystemTask plus xs_assert_v2 DPIC pair under one outer unlikely guard while retaining the inner DPIC recheck.",
+    "The MemoryFill F tier is not present in this baseline and is a closed prior direction; R, W, A, and F must not be reproposed."
   ],
   "patch": "",
   "enable_options": []

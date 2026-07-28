@@ -29,9 +29,15 @@ DEFAULT_CODEX_CONFIG = Path("~/.codex/config.kimi.toml").expanduser()
 DEFAULT_CODEX_AUTH = Path("~/.codex/auth.kimi.json").expanduser()
 DEFAULT_INIT_PROGRAM = TASK_ROOT / "init_program.txt"
 LOCAL_VALIDATION_SCHEMA = TASK_ROOT / "candidate.local.schema.json"
+K3_MODEL_CATALOG = TASK_ROOT / "k3_model_catalog.json"
+K3_INSTRUCTION_SUFFIX = TASK_ROOT / "instruction.k3.txt"
 MODEL = "k3"
 REASONING_EFFORT = "ultra"
 MAX_PROPOSALS = 64
+NUM_CHAINS = 4
+DEFAULT_GEN_CONCURRENCY = NUM_CHAINS
+DEFAULT_LLM_TIMEOUT = 10_800.0
+DEFAULT_CODEX_MAX_AGENT_THREADS = 3
 DEFAULT_PREFLIGHT_TIMEOUT = 600.0
 PREFLIGHT_PROBE_PATH = "wolvrix/lib/emit/grhsim_cpp.cpp"
 PREFLIGHT_PROBE_SUBMODULE_PATH = "lib/emit/grhsim_cpp.cpp"
@@ -218,6 +224,7 @@ def _launch_guard_digest(
             "--init-program",
             "--evaluator",
             "--instruction",
+            "--instruction-suffix",
             "--codex-config",
             "--codex-auth",
             "--codex-output-schema",
@@ -542,6 +549,18 @@ def run_codex_preflight(args: argparse.Namespace) -> int:
     local_schema = _regular_file(
         LOCAL_VALIDATION_SCHEMA, "candidate local validation schema"
     )
+    k3_model_catalog = (
+        _regular_file(K3_MODEL_CATALOG, "K3 model catalog")
+        if MODEL == "k3"
+        else None
+    )
+    max_agent_threads = getattr(
+        args,
+        "codex_max_agent_threads",
+        DEFAULT_CODEX_MAX_AGENT_THREADS,
+    )
+    if MODEL == "k3" and not 1 <= max_agent_threads <= 32:
+        raise SystemExit("--codex-max-agent-threads must be in 1..32")
     evaluator = _load_evaluator()
     preflight_timeout = getattr(
         args, "preflight_timeout", DEFAULT_PREFLIGHT_TIMEOUT
@@ -573,6 +592,10 @@ def run_codex_preflight(args: argparse.Namespace) -> int:
             tool_choice_mode="required-first",
             timeout=float(preflight_timeout),
             max_repair_attempts=0,
+            max_agent_threads=(max_agent_threads if MODEL == "k3" else None),
+            model_catalog_path=(
+                str(k3_model_catalog) if k3_model_catalog is not None else None
+            ),
         )
     except ValueError as error:
         raise SystemExit(
@@ -602,12 +625,20 @@ def run_codex_preflight(args: argparse.Namespace) -> int:
                 "Codex capability preflight failed "
                 f"({error.error_type}): {error.message}"
             ) from None
+        if MODEL == "k3" and any(
+            "Model metadata for k3 not found" in diagnostic
+            for diagnostic in getattr(result.trace, "diagnostic_summaries", ())
+        ):
+            raise SystemExit(
+                "Codex capability preflight used fallback K3 model metadata"
+            )
     finally:
         client.close()
     print(
         "Codex capability preflight passed: "
         f"model={MODEL}, effort={REASONING_EFFORT}, "
         f"repo_tool_calls={result.trace.repo_tool_call_count}, "
+        f"model_catalog={'validated' if MODEL == 'k3' else 'native'}, "
         f"response_chars={len(result.canonical)}, "
         "response_sha256="
         f"{hashlib.sha256(result.canonical.encode('utf-8')).hexdigest()}"
@@ -626,9 +657,19 @@ def build_command(args: argparse.Namespace) -> tuple[list[str], dict[str, str]]:
     local_schema = _regular_file(
         LOCAL_VALIDATION_SCHEMA, "candidate local validation schema"
     )
+    k3_model_catalog = (
+        _regular_file(K3_MODEL_CATALOG, "K3 model catalog")
+        if MODEL == "k3"
+        else None
+    )
     init_program = _regular_file(args.init_program, "initial program")
     evaluator = _regular_file(TASK_ROOT / "evaluator.py", "evaluator")
     instruction = _regular_file(TASK_ROOT / "instruction.txt", "instruction")
+    k3_instruction_suffix = (
+        _regular_file(K3_INSTRUCTION_SUFFIX, "K3 instruction suffix")
+        if MODEL == "k3"
+        else None
+    )
     evaluator_contract = _load_evaluator()
     init_candidate = _parse_seed(init_program, evaluator_contract, "initial program")
     if init_program.name.startswith("best_program.") and init_program.parent.name.startswith(
@@ -657,6 +698,20 @@ def build_command(args: argparse.Namespace) -> tuple[list[str], dict[str, str]]:
         raise SystemExit(f"--max-proposals must be in 1..{MAX_PROPOSALS}")
     if not 1 <= args.valid_target <= args.max_proposals:
         raise SystemExit("--valid-target must be in 1..max-proposals")
+    gen_concurrency = getattr(
+        args, "gen_concurrency", DEFAULT_GEN_CONCURRENCY
+    )
+    if not 1 <= gen_concurrency <= NUM_CHAINS:
+        raise SystemExit(
+            f"--gen-concurrency must be in 1..{NUM_CHAINS}"
+        )
+    max_agent_threads = getattr(
+        args,
+        "codex_max_agent_threads",
+        DEFAULT_CODEX_MAX_AGENT_THREADS,
+    )
+    if MODEL == "k3" and not 1 <= max_agent_threads <= 32:
+        raise SystemExit("--codex-max-agent-threads must be in 1..32")
 
     output_path = args.output_path
     if output_path is None:
@@ -696,13 +751,13 @@ def build_command(args: argparse.Namespace) -> tuple[list[str], dict[str, str]]:
         "--selector",
         "rpucg",
         "--num-chains",
-        "4",
+        str(NUM_CHAINS),
         "--k-candidates",
         "1",
         "--eval-concurrency",
         "1",
         "--gen-concurrency",
-        "1",
+        str(gen_concurrency),
         "--init-eval-repeats",
         "1",
         "--max-generations",
@@ -728,6 +783,19 @@ def build_command(args: argparse.Namespace) -> tuple[list[str], dict[str, str]]:
         "--output-path",
         str(output_path),
     ]
+    if MODEL == "k3":
+        assert k3_model_catalog is not None
+        assert k3_instruction_suffix is not None
+        command.extend(
+            [
+                "--instruction-suffix",
+                str(k3_instruction_suffix),
+                "--codex-max-agent-threads",
+                str(max_agent_threads),
+                "--codex-model-catalog",
+                str(k3_model_catalog),
+            ]
+        )
     if resume_state is not None:
         command.extend(["--resume", str(resume_state)])
     command = [
@@ -786,7 +854,35 @@ def main() -> int:
     parser.add_argument("--max-proposals", type=int, default=16)
     parser.add_argument("--valid-target", type=int, default=8)
     parser.add_argument("--eval-timeout", type=float, default=21_600.0)
-    parser.add_argument("--llm-timeout", type=float, default=3_000.0)
+    parser.add_argument(
+        "--llm-timeout",
+        type=float,
+        default=DEFAULT_LLM_TIMEOUT,
+        help=(
+            "Per-generation Codex timeout in seconds "
+            f"(default: {DEFAULT_LLM_TIMEOUT:g})"
+        ),
+    )
+    parser.add_argument(
+        "--gen-concurrency",
+        type=int,
+        default=DEFAULT_GEN_CONCURRENCY,
+        help=(
+            "Concurrent Codex generation workers; bounded by the "
+            f"{NUM_CHAINS} research chains "
+            f"(default: {DEFAULT_GEN_CONCURRENCY})"
+        ),
+    )
+    parser.add_argument(
+        "--codex-max-agent-threads",
+        type=int,
+        default=DEFAULT_CODEX_MAX_AGENT_THREADS,
+        help=(
+            "Maximum concurrently open K3-spawned subagents; this is not "
+            "passed to other models "
+            f"(default: {DEFAULT_CODEX_MAX_AGENT_THREADS})"
+        ),
+    )
     parser.add_argument(
         "--preflight-timeout",
         type=float,

@@ -69,6 +69,8 @@ def create_llm_client(config: EngineConfig) -> LLMBackend:
             local_validation_schema=config.codex_local_validation_schema,
             output_mode=config.codex_output_mode,
             tool_choice_mode=config.codex_tool_choice_mode,
+            max_agent_threads=config.codex_max_agent_threads,
+            model_catalog_path=config.codex_model_catalog_path,
             timeout=config.timeout,
             pool_size=config.gen_concurrency,
         )

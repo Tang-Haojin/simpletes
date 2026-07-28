@@ -1919,7 +1919,7 @@ def _write_v2_checkpoint_seed(path: Path, *, pin_override=None) -> str:
     return text
 
 
-def test_launcher_uses_fixed_model_serial_budget_and_only_secret_file_paths(
+def test_launcher_uses_fixed_model_parallel_generation_and_only_secret_file_paths(
     monkeypatch, tmp_path: Path
 ):
     monkeypatch.setenv("GRHSIM_VERIFY_DEFAULT_OFF", "0")
@@ -1955,7 +1955,16 @@ def test_launcher_uses_fixed_model_serial_budget_and_only_secret_file_paths(
     assert "--max-valid-evaluations 8" in rendered
     assert "--max-generations 16" in rendered
     assert "--eval-concurrency 1" in rendered
-    assert "--gen-concurrency 1" in rendered
+    assert "--gen-concurrency 4" in rendered
+    assert "--codex-max-agent-threads 3" in rendered
+    assert "--codex-model-catalog" in rendered
+    assert "--instruction-suffix" in rendered
+    suffix_index = command.index("--instruction-suffix")
+    assert command[suffix_index + 1] == str(
+        launcher.K3_INSTRUCTION_SUFFIX.resolve()
+    )
+    catalog_index = command.index("--codex-model-catalog")
+    assert command[catalog_index + 1] == str(launcher.K3_MODEL_CATALOG.resolve())
     assert "--skip-preflight" in rendered
     local_schema_index = command.index("--codex-local-validation-schema")
     assert command[local_schema_index + 1] == str(
@@ -1977,6 +1986,16 @@ def test_launcher_uses_fixed_model_serial_budget_and_only_secret_file_paths(
     assert environment["GRHSIM_RUN_FOCUSED_TESTS"] == "1"
     assert "do-not-leak" not in rendered
     assert "do-not-leak" not in json.dumps(environment)
+    assert "subagent" not in (
+        TASK_ROOT / "instruction.txt"
+    ).read_text(encoding="utf-8").lower()
+
+    monkeypatch.setattr(launcher, "MODEL", "gpt-5.6-sol")
+    native_command, _native_environment = launcher.build_command(args)
+    native_rendered = " ".join(native_command)
+    assert "--codex-max-agent-threads" not in native_rendered
+    assert "--codex-model-catalog" not in native_rendered
+    assert "--instruction-suffix" not in native_rendered
 
 
 def test_launcher_uses_explicit_best_program_as_initial_seed(tmp_path: Path):
@@ -2042,6 +2061,21 @@ def test_launcher_accepts_long_bounded_continuation_and_rejects_oversize_budget(
     assert "--max-valid-evaluations 16" in rendered
     assert "--timeout 5400.0" in rendered
 
+    args.gen_concurrency = 0
+    with pytest.raises(SystemExit, match=r"--gen-concurrency must be in 1\.\.4"):
+        launcher.build_command(args)
+    args.gen_concurrency = launcher.NUM_CHAINS + 1
+    with pytest.raises(SystemExit, match=r"--gen-concurrency must be in 1\.\.4"):
+        launcher.build_command(args)
+    args.gen_concurrency = launcher.DEFAULT_GEN_CONCURRENCY
+    args.codex_max_agent_threads = 0
+    with pytest.raises(
+        SystemExit,
+        match=r"--codex-max-agent-threads must be in 1\.\.32",
+    ):
+        launcher.build_command(args)
+
+    args.codex_max_agent_threads = launcher.DEFAULT_CODEX_MAX_AGENT_THREADS
     args.max_proposals = launcher.MAX_PROPOSALS + 1
     with pytest.raises(SystemExit, match=r"--max-proposals must be in 1\.\.64"):
         launcher.build_command(args)
@@ -2452,7 +2486,11 @@ def test_launcher_capability_preflight_is_repo_grounded_and_research_free(
 
         async def capability_probe(self, prompt, *, validate=None):
             captured["prompt"] = prompt
-            trace = SimpleNamespace(repo_tool_call_count=2, repo_tool_types=("shell",))
+            trace = SimpleNamespace(
+                repo_tool_call_count=2,
+                repo_tool_types=("shell",),
+                diagnostic_summaries=(),
+            )
             assert validate is not None
             assert validate(payload, trace) is None
             return SimpleNamespace(
@@ -2499,6 +2537,10 @@ def test_launcher_capability_preflight_is_repo_grounded_and_research_free(
     assert captured["kwargs"]["tool_choice_mode"] == "required-first"
     assert captured["kwargs"]["timeout"] == 600.0
     assert captured["kwargs"]["max_repair_attempts"] == 0
+    assert captured["kwargs"]["max_agent_threads"] == 3
+    assert captured["kwargs"]["model_catalog_path"] == str(
+        launcher.K3_MODEL_CATALOG.resolve()
+    )
     assert evaluator.PINNED_WOLVRIX_COMMIT in captured["prompt"]
     assert launcher.PREFLIGHT_PROBE_SUBMODULE_PATH in captured["prompt"]
     assert nonce in captured["prompt"]
@@ -2510,6 +2552,7 @@ def test_launcher_capability_preflight_is_repo_grounded_and_research_free(
     output = capsys.readouterr().out
     assert "capability preflight passed" in output
     assert "repo_tool_calls=2" in output
+    assert "model_catalog=validated" in output
 
 
 def test_launcher_capability_failure_includes_backend_scrubbed_diagnostic(

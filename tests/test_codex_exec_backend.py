@@ -67,6 +67,11 @@ def _make_inputs(tmp_path: Path) -> dict[str, Path]:
     schema.write_text(json.dumps(SCHEMA), encoding="utf-8")
     local_schema = tmp_path / "local-validation-schema.json"
     local_schema.write_text(json.dumps(LOCAL_VALIDATION_SCHEMA), encoding="utf-8")
+    model_catalog = tmp_path / "model-catalog.json"
+    model_catalog.write_text(
+        json.dumps({"models": [{"slug": "gpt-5.6-sol"}]}),
+        encoding="utf-8",
+    )
     repo = tmp_path / "repo"
     repo.mkdir()
 
@@ -116,6 +121,17 @@ record = {
     "home": str(home),
     "home_mode": stat.S_IMODE(home.stat().st_mode),
     "config_mode": stat.S_IMODE((home / "config.toml").stat().st_mode),
+    "model_catalog_exists": (home / "model_catalog.json").exists(),
+    "model_catalog_mode": (
+        stat.S_IMODE((home / "model_catalog.json").stat().st_mode)
+        if (home / "model_catalog.json").exists()
+        else None
+    ),
+    "model_catalog_text": (
+        (home / "model_catalog.json").read_text()
+        if (home / "model_catalog.json").exists()
+        else None
+    ),
     "auth_exists": (home / "auth.json").exists(),
     "inherited_api_key": os.environ.get("OPENAI_API_KEY"),
     "inherited_webhook": os.environ.get("WX_WEBHOOK_URL"),
@@ -143,6 +159,7 @@ sys.exit(status)
         "auth": auth,
         "schema": schema,
         "local_schema": local_schema,
+        "model_catalog": model_catalog,
         "repo": repo,
         "executable": executable,
         "settings": settings,
@@ -572,6 +589,72 @@ def test_capability_probe_returns_repo_tool_trace_and_canonical_value(
     assert result.trace.failure_summaries == ()
 
 
+def test_collaboration_trace_is_deduplicated_and_payload_free(
+    tmp_path: Path,
+) -> None:
+    paths = _make_inputs(tmp_path)
+    private_prompt = "private-child-task-must-not-be-saved"
+    private_message = "private-child-message-must-not-be-saved"
+    _set_fake(
+        paths,
+        response={"schema_version": 1, "patch": "collaborative\n"},
+        events=[
+            {
+                "type": "item.started",
+                "item": {
+                    "id": "collab-1",
+                    "type": "collab_tool_call",
+                    "tool": "spawn_agent",
+                    "prompt": private_prompt,
+                },
+            },
+            {
+                "type": "item.completed",
+                "item": {
+                    "id": "collab-1",
+                    "type": "collab_tool_call",
+                    "tool": "spawn_agent",
+                    "agents_states": {
+                        "child": {"status": "completed", "message": private_message}
+                    },
+                },
+            },
+            {
+                "type": "item.completed",
+                "item": {
+                    "id": "collab-2",
+                    "type": "collab_tool_call",
+                    "tool": "send_input",
+                    "prompt": private_prompt,
+                },
+            },
+            {
+                "type": "item.completed",
+                "item": {
+                    "id": "collab-3",
+                    "type": "collab_tool_call",
+                    "tool": "wait",
+                },
+            },
+        ],
+    )
+
+    result = asyncio.run(
+        _client(paths).generate("collaborate", track_io=True)
+    )
+    tracked = json.loads(result.raw_output or "")
+    audit = tracked["simpletes_codex_audit"]
+
+    assert audit["collaboration_tool_call_count"] == 3
+    assert audit["collaboration_tool_call_counts"] == {
+        "send_input": 1,
+        "spawn_agent": 1,
+        "wait": 1,
+    }
+    assert private_prompt not in (result.raw_output or "")
+    assert private_message not in (result.raw_output or "")
+
+
 def test_capability_probe_rejects_response_without_repo_tool_call(
     tmp_path: Path,
 ) -> None:
@@ -867,6 +950,57 @@ def test_codex_tool_choice_mode_must_be_known(tmp_path: Path) -> None:
         _client(paths, tool_choice_mode="unknown-mode")
 
 
+def test_codex_agent_thread_limit_is_validated_and_forwarded(tmp_path: Path) -> None:
+    paths = _make_inputs(tmp_path)
+    with pytest.raises(ValueError, match="max_agent_threads must be in 1..32"):
+        _client(paths, max_agent_threads=0)
+
+    _set_fake(paths, response={"schema_version": 1, "patch": "diff\n"})
+    client = _client(paths, max_agent_threads=2)
+    asyncio.run(client.generate("bounded agents"))
+    invocation = json.loads(paths["log"].read_text(encoding="utf-8"))
+
+    args = invocation["args"]
+    assert "--enable" in args
+    assert args[args.index("--enable") + 1] == "multi_agent"
+    disabled_features = {
+        args[index + 1]
+        for index, value in enumerate(args[:-1])
+        if value == "--disable"
+    }
+    assert "multi_agent_v2" in disabled_features
+    assert "agents.enabled=true" in args
+    assert "agents.max_concurrent_threads_per_session=2" in args
+
+
+def test_codex_model_catalog_is_private_and_forwarded(tmp_path: Path) -> None:
+    paths = _make_inputs(tmp_path)
+    _set_fake(paths, response={"schema_version": 1, "patch": "diff\n"})
+
+    asyncio.run(
+        _client(
+            paths,
+            model_catalog_path=str(paths["model_catalog"]),
+        ).generate("catalog")
+    )
+    invocation = json.loads(paths["log"].read_text(encoding="utf-8"))
+    args = invocation["args"]
+
+    catalog_override = next(
+        value for value in args if value.startswith("model_catalog_json=")
+    )
+    private_path = Path(json.loads(catalog_override.split("=", 1)[1]))
+    assert private_path.name == "model_catalog.json"
+    assert private_path.parent == Path(invocation["home"])
+    assert str(paths["model_catalog"]) not in args
+    assert invocation["model_catalog_exists"] is True
+    assert invocation["model_catalog_mode"] == 0o600
+    assert json.loads(invocation["model_catalog_text"]) == {
+        "models": [{"slug": "gpt-5.6-sol"}]
+    }
+    assert not private_path.exists()
+
+
 def test_required_first_tool_choice_needs_safe_explicit_base_url(
     tmp_path: Path,
 ) -> None:
@@ -1032,6 +1166,8 @@ def test_cli_builds_local_validation_overlay_config(tmp_path: Path) -> None:
             str(tmp_path / "evaluator.py"),
             "--instruction",
             str(tmp_path / "instruction.txt"),
+            "--instruction-suffix",
+            str(tmp_path / "instruction.k3.txt"),
             "--llm-backend",
             "codex_exec",
             "--codex-config",
@@ -1048,14 +1184,21 @@ def test_cli_builds_local_validation_overlay_config(tmp_path: Path) -> None:
             "local-json",
             "--codex-tool-choice-mode",
             "required-first",
+            "--codex-max-agent-threads",
+            "2",
+            "--codex-model-catalog",
+            str(paths["model_catalog"]),
         ]
     )
 
     config = build_config_from_args(args)
 
     assert config.codex_local_validation_schema == str(paths["local_schema"])
+    assert config.instruction_suffix_path == str(tmp_path / "instruction.k3.txt")
     assert config.codex_output_mode == "local-json"
     assert config.codex_tool_choice_mode == "required-first"
+    assert config.codex_max_agent_threads == 2
+    assert config.codex_model_catalog_path == str(paths["model_catalog"])
 
 
 def test_factory_passes_overlay_and_repairs_empty_provider_response(
@@ -1083,6 +1226,7 @@ def test_factory_passes_overlay_and_repairs_empty_provider_response(
         codex_local_validation_schema=str(paths["local_schema"]),
         codex_output_mode="local-json",
         codex_tool_choice_mode="auto",
+        codex_model_catalog_path=str(paths["model_catalog"]),
         timeout=10,
     )
 

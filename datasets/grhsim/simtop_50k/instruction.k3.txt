@@ -1,0 +1,5 @@
+K3 collaboration policy: when spawned-agent collaboration tools are available,
+you may freely delegate any useful parts of the research. Decide autonomously
+whether, when, and how to use up to three concurrently open subagents; no roles
+or delegation pattern are prescribed. Collaboration is optional and must still
+converge on one candidate.

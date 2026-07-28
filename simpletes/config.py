@@ -114,6 +114,7 @@ class EngineConfig:
     init_program: str
     evaluator_path: str
     instruction_path: str
+    instruction_suffix_path: str | None = None
     
     # Budget / termination
     max_generations: int = 100
@@ -154,6 +155,8 @@ class EngineConfig:
     codex_local_validation_schema: str | None = None
     codex_output_mode: str = "provider-structured"
     codex_tool_choice_mode: str = "auto"
+    codex_max_agent_threads: int | None = None
+    codex_model_catalog_path: str | None = None
 
     # Token forcing (vllm_token_forcing backend)
     reasoning_budget: int | None = 32768  # Phase 1 total budget (prompt + reasoning). None = auto from context_window - response_budget
@@ -212,6 +215,7 @@ def build_config_from_args(args: Any) -> EngineConfig:
         init_program=args.init_program,
         evaluator_path=args.evaluator,
         instruction_path=args.instruction,
+        instruction_suffix_path=args.instruction_suffix,
         eval_venv=args.eval_venv,
         eval_python=resolve_eval_python(evaluator_path=args.evaluator, eval_venv=args.eval_venv),
         max_generations=args.max_generations,
@@ -245,6 +249,8 @@ def build_config_from_args(args: Any) -> EngineConfig:
         codex_local_validation_schema=args.codex_local_validation_schema,
         codex_output_mode=args.codex_output_mode,
         codex_tool_choice_mode=args.codex_tool_choice_mode,
+        codex_max_agent_threads=args.codex_max_agent_threads,
+        codex_model_catalog_path=args.codex_model_catalog,
         reflection_mode=not args.disable_reflection,
         output_path=args.output_path,
         log_interval=args.log_interval,

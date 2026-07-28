@@ -29,6 +29,14 @@ def build_parser(*, mode: str = "single") -> argparse.ArgumentParser:
     parser.add_argument("--init-program", help="Path to initial program")
     parser.add_argument("--evaluator", help="Path to evaluator module")
     parser.add_argument("--instruction", help="Path to instruction file")
+    parser.add_argument(
+        "--instruction-suffix",
+        default=EngineConfig.instruction_suffix_path,
+        help=(
+            "Optional instruction file appended to the base task prompt; "
+            "unset leaves the base prompt byte-for-byte unchanged"
+        ),
+    )
 
     # Budget / termination
     parser.add_argument(
@@ -410,6 +418,24 @@ def build_parser(*, mode: str = "single") -> argparse.ArgumentParser:
             "(codex_exec) auto preserves Codex requests; required-first uses a "
             "private loopback compatibility proxy to require a tool on the first "
             "Responses request of each attempt"
+        ),
+    )
+    parser.add_argument(
+        "--codex-max-agent-threads",
+        type=int,
+        default=EngineConfig.codex_max_agent_threads,
+        help=(
+            "(codex_exec) Maximum concurrently open spawned-agent threads "
+            "per Codex generation; unset preserves the Codex default"
+        ),
+    )
+    parser.add_argument(
+        "--codex-model-catalog",
+        type=str,
+        default=EngineConfig.codex_model_catalog_path,
+        help=(
+            "(codex_exec) Optional complete Codex model catalog JSON; copied "
+            "into each private Codex home"
         ),
     )
     # Resume

@@ -12,6 +12,7 @@ request finishes.
 from __future__ import annotations
 
 import asyncio
+from collections import Counter
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -84,6 +85,9 @@ _DEFAULT_TOOL_CHOICE_MODE = "auto"
 _REPO_TOOL_ITEM_TYPES = frozenset(
     {"command_execution", "exec_command", "file_read", "shell_command"}
 )
+_COLLABORATION_TOOL_NAMES = frozenset(
+    {"spawn_agent", "send_input", "wait", "close_agent"}
+)
 
 
 @dataclass(frozen=True)
@@ -94,6 +98,8 @@ class CodexTraceSummary:
     event_count: int
     repo_tool_call_count: int
     repo_tool_types: tuple[str, ...]
+    collaboration_tool_call_count: int
+    collaboration_tool_call_counts: tuple[tuple[str, int], ...]
     failure_summaries: tuple[str, ...]
     diagnostic_summaries: tuple[str, ...]
 
@@ -103,6 +109,10 @@ class CodexTraceSummary:
             "event_count": self.event_count,
             "repo_tool_call_count": self.repo_tool_call_count,
             "repo_tool_types": list(self.repo_tool_types),
+            "collaboration_tool_call_count": self.collaboration_tool_call_count,
+            "collaboration_tool_call_counts": dict(
+                self.collaboration_tool_call_counts
+            ),
             "failure_summaries": list(self.failure_summaries),
             "diagnostic_summaries": list(self.diagnostic_summaries),
         }
@@ -122,6 +132,8 @@ class _AttemptTrace:
     event_count: int
     repo_tool_call_count: int
     repo_tool_types: tuple[str, ...]
+    collaboration_tool_call_count: int
+    collaboration_tool_call_counts: tuple[tuple[str, int], ...]
     diagnostics: tuple[str, ...]
 
 
@@ -155,6 +167,8 @@ class CodexExecClient:
         local_validation_schema: str | None = None,
         output_mode: str = _DEFAULT_OUTPUT_MODE,
         tool_choice_mode: str = _DEFAULT_TOOL_CHOICE_MODE,
+        max_agent_threads: int | None = None,
+        model_catalog_path: str | None = None,
     ) -> None:
         del pool_size  # The engine owns generation concurrency.
         self.model = model
@@ -187,6 +201,19 @@ class CodexExecClient:
             choices = ", ".join(sorted(_TOOL_CHOICE_MODES))
             raise ValueError(f"Codex tool_choice_mode must be one of: {choices}")
         self.tool_choice_mode = tool_choice_mode
+        if max_agent_threads is not None and (
+            type(max_agent_threads) is not int
+            or not 1 <= max_agent_threads <= 32
+        ):
+            raise ValueError("Codex max_agent_threads must be in 1..32")
+        self.max_agent_threads = max_agent_threads
+        self.model_catalog_path = (
+            self._resolve_regular_input(
+                Path(model_catalog_path), "Codex model catalog"
+            )
+            if model_catalog_path is not None
+            else None
+        )
         if (
             type(max_repair_attempts) is not int
             or not 0 <= max_repair_attempts <= _MAX_REPAIR_ATTEMPTS
@@ -233,6 +260,10 @@ class CodexExecClient:
             self._require_regular_file(
                 self.local_validation_schema_path,
                 "Codex local validation schema",
+            )
+        if self.model_catalog_path is not None:
+            self._require_regular_file(
+                self.model_catalog_path, "Codex model catalog"
             )
         if not self.repo_root.is_dir():
             raise ValueError(
@@ -502,6 +533,7 @@ class CodexExecClient:
         event_count = 0
         tool_ids: set[str] = set()
         tool_types: set[str] = set()
+        collaboration_ids: dict[str, str] = {}
         diagnostics: list[str] = []
         try:
             stdout, stdout_truncated = self._read_bounded_file(
@@ -534,6 +566,17 @@ class CodexExecClient:
             if not isinstance(item, dict):
                 continue
             item_type = item.get("type")
+            if item_type == "collab_tool_call":
+                tool_name = item.get("tool")
+                if tool_name not in _COLLABORATION_TOOL_NAMES:
+                    continue
+                item_id = item.get("id")
+                if not isinstance(item_id, str) or not item_id:
+                    if event.get("type") != "item.completed":
+                        continue
+                    item_id = f"line-{line_number}"
+                collaboration_ids.setdefault(item_id, tool_name)
+                continue
             if not isinstance(item_type, str) or item_type not in _REPO_TOOL_ITEM_TYPES:
                 continue
             item_id = item.get("id")
@@ -559,6 +602,10 @@ class CodexExecClient:
             event_count=event_count,
             repo_tool_call_count=len(tool_ids),
             repo_tool_types=tuple(sorted(tool_types)),
+            collaboration_tool_call_count=len(collaboration_ids),
+            collaboration_tool_call_counts=tuple(
+                sorted(Counter(collaboration_ids.values()).items())
+            ),
             diagnostics=tuple(diagnostics[:8]),
         )
 
@@ -566,6 +613,11 @@ class CodexExecClient:
     def _aggregate_trace(
         attempts: list[_AttemptTrace], failures: list[str]
     ) -> CodexTraceSummary:
+        collaboration_counts: Counter[str] = Counter()
+        for attempt in attempts:
+            collaboration_counts.update(
+                dict(attempt.collaboration_tool_call_counts)
+            )
         return CodexTraceSummary(
             attempt_count=len(attempts),
             event_count=sum(attempt.event_count for attempt in attempts),
@@ -580,6 +632,10 @@ class CodexExecClient:
                         for item_type in attempt.repo_tool_types
                     }
                 )
+            ),
+            collaboration_tool_call_count=sum(collaboration_counts.values()),
+            collaboration_tool_call_counts=tuple(
+                sorted(collaboration_counts.items())
             ),
             failure_summaries=tuple(failures),
             diagnostic_summaries=tuple(
@@ -735,6 +791,12 @@ class CodexExecClient:
             self._provider_override() as provider,
         ):
             self._copy_private(self.config_path, codex_home / "config.toml")
+            private_model_catalog: Path | None = None
+            if self.model_catalog_path is not None:
+                private_model_catalog = codex_home / "model_catalog.json"
+                self._copy_private(
+                    self.model_catalog_path, private_model_catalog
+                )
             output_path = codex_home / "last-message.json"
             stdout_path = codex_home / "events.jsonl"
             stderr_path = codex_home / "stderr.log"
@@ -791,6 +853,28 @@ class CodexExecClient:
                 "--json",
                 ]
             )
+            if self.max_agent_threads is not None:
+                command.extend(
+                    [
+                        "--enable",
+                        "multi_agent",
+                        "--disable",
+                        "multi_agent_v2",
+                        "-c",
+                        "agents.enabled=true",
+                        "-c",
+                        "agents.max_concurrent_threads_per_session="
+                        f"{self.max_agent_threads}",
+                    ]
+                )
+            if private_model_catalog is not None:
+                command.extend(
+                    [
+                        "-c",
+                        "model_catalog_json="
+                        f"{json.dumps(str(private_model_catalog))}",
+                    ]
+                )
             if provider.base_url is not None:
                 command.extend(
                     [
@@ -950,7 +1034,10 @@ class CodexExecClient:
 
     @staticmethod
     def _tracked_raw_output(result: CodexProbeResult) -> str:
-        if not result.trace.failure_summaries:
+        if (
+            not result.trace.failure_summaries
+            and result.trace.collaboration_tool_call_count == 0
+        ):
             return result.canonical
         # Candidate extraction consumes ``text``. The saved raw-output field
         # can therefore retain this bounded audit envelope after a repair.

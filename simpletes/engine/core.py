@@ -128,6 +128,12 @@ class SimpleTESEngine(SchedulerMixin):
         # Load instruction
         with open(config.instruction_path, encoding="utf-8") as f:
             self.instruction = f.read()
+        if config.instruction_suffix_path is not None:
+            with open(config.instruction_suffix_path, encoding="utf-8") as f:
+                suffix = f.read()
+            self.instruction = (
+                f"{self.instruction.rstrip()}\n\n{suffix.strip()}\n"
+            )
 
         self.worker = EvaluatorWorker(
             config.evaluator_path,
@@ -299,6 +305,14 @@ class SimpleTESEngine(SchedulerMixin):
             f"[dim]Init program:[/dim] [cyan]{c.init_program}[/cyan]",
             f"[dim]Evaluator:[/dim] [cyan]{c.evaluator_path}[/cyan]",
             f"[dim]Instruction:[/dim] [cyan]{c.instruction_path}[/cyan]",
+            *(
+                [
+                    "[dim]Instruction suffix:[/dim] "
+                    f"[cyan]{c.instruction_suffix_path}[/cyan]"
+                ]
+                if c.instruction_suffix_path is not None
+                else []
+            ),
             "",
             "[bold]── Policy ──[/bold]",
             f"[dim]Selector:[/dim] [cyan]{policy}[/cyan]",

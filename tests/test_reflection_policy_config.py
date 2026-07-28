@@ -177,6 +177,7 @@ def test_checkpoint_config_persists_k3_generation_provenance_without_auth(
         init_program="init.py",
         evaluator_path="eval.py",
         instruction_path="prompt.txt",
+        instruction_suffix_path="prompt.k3.txt",
         model="k3",
         reasoning_effort="ultra",
         llm_backend="codex_exec",
@@ -188,6 +189,8 @@ def test_checkpoint_config_persists_k3_generation_provenance_without_auth(
         codex_local_validation_schema="/work/candidate.local.schema.json",
         codex_output_mode="local-json",
         codex_tool_choice_mode="required-first",
+        codex_max_agent_threads=3,
+        codex_model_catalog_path="/work/k3_model_catalog.json",
         llm_policy_api_key="policy-key-must-not-persist",
     )
     manager = CheckpointManager(config, "instance-id", str(tmp_path))
@@ -210,6 +213,7 @@ def test_checkpoint_config_persists_k3_generation_provenance_without_auth(
     assert len(config_paths) == 1
     on_disk = json.loads(config_paths[0].read_text(encoding="utf-8"))
     assert on_disk["model"] == "k3"
+    assert on_disk["instruction_suffix_path"] == "prompt.k3.txt"
     assert on_disk["reasoning_effort"] == "ultra"
     assert on_disk["llm_backend"] == "codex_exec"
     assert on_disk["codex_config_path"] == "/safe/config.kimi.toml"
@@ -220,6 +224,8 @@ def test_checkpoint_config_persists_k3_generation_provenance_without_auth(
     )
     assert on_disk["codex_output_mode"] == "local-json"
     assert on_disk["codex_tool_choice_mode"] == "required-first"
+    assert on_disk["codex_max_agent_threads"] == 3
+    assert on_disk["codex_model_catalog_path"] == "/work/k3_model_catalog.json"
 
     rendered = json.dumps(on_disk, sort_keys=True)
     assert "codex_auth_path" not in on_disk

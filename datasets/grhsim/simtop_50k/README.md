@@ -26,9 +26,13 @@ candidate budget.
 ## Start fresh, then continue only within the post-RWA pins
 
 The launcher fixes the requested model to Codex-compatible `k3` with reasoning
-effort `ultra`, uses four RPUCG chains with `k=1`, serial generation/evaluation, stops
-after eight valid generated candidates or sixteen proposals, and disables
-reflection. It sources the target checkout's `env.sh` before executing
+effort `ultra`, uses four RPUCG chains with `k=1`, runs four generation workers
+in parallel while keeping evaluation serial, stops after eight valid generated
+candidates or sixteen proposals, and disables reflection. Each K3 generation
+has a three-hour (`10800 s`) timeout and may freely use up to three concurrently
+open subagents, without prescribed roles. The subagent flag, cap, and prompt
+apply only to K3; other models retain their native delegation behavior. It
+sources the target checkout's `env.sh` before executing
 SimpleTES and forces attribution verification, focused tests, and function
 gates on, regardless of inherited shell settings. It passes only the paths of
 the Kimi configuration files. The config is copied to the backend's private
@@ -67,6 +71,11 @@ Defaults:
 
 - target checkout: sibling `wolvrix-playground-gsim-calibrate-5`
 - model/provider: `k3` / `kimi`, reasoning effort `ultra`
+- generation/evaluation concurrency: `4` / `1`
+- generation timeout: `10800 s`
+- maximum concurrently open K3 subagents per generation: `3`
+- K3 context/model catalog: `k3_model_catalog.json` (`1000000` configured
+  context tokens, `1048576` advertised maximum, `900000` auto-compact limit)
 - config: `~/.codex/config.kimi.toml`
 - auth: `~/.codex/auth.kimi.json`
 - capability preflight timeout: `600 s` (independent of generation timeout)
@@ -122,7 +131,8 @@ GRHSIM_INFRA_RETRIES=4 \
   --init-program checkpoints/grhsim_simtop_50k/<post-rwa-run>/<date>/instance-<id>/db_state_<time>/best_program.txt \
   --max-proposals 32 \
   --valid-target 16 \
-  --llm-timeout 5400
+  --llm-timeout 10800 \
+  --gen-concurrency 4
 ```
 
 `GRHSIM_INFRA_RETRIES=4` keeps up to five quiet-CCD runtime attempts inside one

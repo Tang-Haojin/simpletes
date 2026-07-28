@@ -7,7 +7,7 @@ Result artifacts are organized by the five scientific domains used in the paper.
 | Task | What it is |
 |---|---|
 | `quantum_compilation/qubit_routing_on_superconducting_quantum_computer/` | Routing policy for two-qubit gates on a superconducting chip, minimizing added SWAPs (Rust) |
-| `quantum_compilation/compilation_for_zoned_neutral_atom_quantum_architectures/` | Gate scheduling for a zoned neutral-atom quantum architecture, minimizing total stage count |
+| `quantum_compilation/compilation_for_zoned_neutral_atom_quantum_architectures/` | Compilation policy for a zoned neutral-atom architecture; the paper reports geometric-mean execution time |
 
 ## Astrodynamics
 
@@ -37,9 +37,9 @@ Additional released artifacts: [`scientific_algorithms/ahc039_purse_seine_fishin
 
 | Task | What it is |
 |---|---|
-| `ai_foundations/trimul/` | CUDA kernel for triangular matrix multiplication (H100, ms) |
-| `ai_foundations/asymmetric_matrix_multiplication/` | CUDA kernel for asymmetric matmul |
-| `ai_foundations/batched_cumsum/` | CUDA kernel for batched prefix-sum (H100, ms) |
+| `ai_foundations/trimul/` | Triton kernel for triangular matrix multiplication (headline result on H100, ms) |
+| `ai_foundations/asymmetric_matrix_multiplication/` | Triton kernel for asymmetric matmul (H200, ms) |
+| `ai_foundations/batched_cumsum/` | Triton kernel for batched prefix-sum (H200, ms) |
 | `ai_foundations/parallel_scaling_law/` | Symbolic scaling-law extrapolation on the `parallel` split |
 | `ai_foundations/domain_mixture_scaling_law/` | Scaling law on the `domain_mixture` split |
 | `ai_foundations/learning_rate_and_batch_size_scaling_law/` | Scaling law on the `lr & bsz` split |
@@ -52,10 +52,10 @@ Additional released artifacts: [`scientific_algorithms/ahc039_purse_seine_fishin
 | `mathematics_discovery/erdos_minimum_overlap/` | Erdős minimum overlap problem — constructions minimizing the overlap statistic |
 | `mathematics_discovery/second_autocorrelation_inequality/` | Second autocorrelation inequality |
 | `mathematics_discovery/third_autocorrelation_inequality/` | Third autocorrelation inequality |
-| `mathematics_discovery/sum_difference_problem/` | Sum-difference set constructions maximizing $\|A+A\| / \|A-A\|$ |
-| `mathematics_discovery/circle_packing_in_a_unit_square_n26/` | 26 non-overlapping circles packed in a unit square, maximizing the minimum radius |
+| `mathematics_discovery/sum_difference_problem/` | Sum-difference set constructions maximizing $|A+A| / |A-A|$ |
+| `mathematics_discovery/circle_packing_in_a_unit_square_n26/` | 26 non-overlapping circles packed in a unit square, maximizing the sum of radii |
 | `mathematics_discovery/circle_packing_in_a_unit_square_n32/` | Same task at $N = 32$ |
-| `mathematics_discovery/hadamard_maximum_determinant_order_29/` | $\pm 1$ matrix of order 29 maximizing $\|\det\|$ |
+| `mathematics_discovery/hadamard_maximum_determinant_order_29/` | $\pm 1$ matrix of order 29 maximizing $|\det|$ |
 
 Additional released artifact: [`mathematics_discovery/first_autocorrelation_inequality/`](mathematics_discovery/first_autocorrelation_inequality/).
 

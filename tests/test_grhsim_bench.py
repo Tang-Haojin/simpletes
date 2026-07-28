@@ -1990,9 +1990,16 @@ def test_launcher_uses_fixed_model_parallel_generation_and_only_secret_file_path
         TASK_ROOT / "instruction.txt"
     ).read_text(encoding="utf-8").lower()
 
-    monkeypatch.setattr(launcher, "MODEL", "gpt-5.6-sol")
+    args.model = "gpt-5.6-sol"
+    args.reasoning_effort = "ultra"
     native_command, _native_environment = launcher.build_command(args)
     native_rendered = " ".join(native_command)
+    assert "--model gpt-5.6-sol" in native_rendered
+    assert "--reasoning-effort ultra" in native_rendered
+    native_output_mode_index = native_command.index("--codex-output-mode")
+    assert native_command[native_output_mode_index + 1] == "provider-structured"
+    native_tool_choice_index = native_command.index("--codex-tool-choice-mode")
+    assert native_command[native_tool_choice_index + 1] == "auto"
     assert "--codex-max-agent-threads" not in native_rendered
     assert "--codex-model-catalog" not in native_rendered
     assert "--instruction-suffix" not in native_rendered
@@ -2256,6 +2263,8 @@ def test_launcher_cli_defaults_to_dataset_initial_program(monkeypatch, capsys):
         captured["init_program"] = args.init_program
         captured["codex_config"] = args.codex_config
         captured["codex_auth"] = args.codex_auth
+        captured["model"] = args.model
+        captured["reasoning_effort"] = args.reasoning_effort
         return ["true"], {}
 
     monkeypatch.setattr(launcher, "build_command", fake_build_command)
@@ -2265,6 +2274,38 @@ def test_launcher_cli_defaults_to_dataset_initial_program(monkeypatch, capsys):
     assert captured["init_program"] == launcher.DEFAULT_INIT_PROGRAM
     assert captured["codex_config"] == Path("~/.codex/config.kimi.toml").expanduser()
     assert captured["codex_auth"] == Path("~/.codex/auth.kimi.json").expanduser()
+    assert captured["model"] == "k3"
+    assert captured["reasoning_effort"] == "ultra"
+    assert capsys.readouterr().out.strip() == "true"
+
+
+def test_launcher_cli_accepts_explicit_native_model(monkeypatch, capsys):
+    captured = {}
+
+    def fake_build_command(args):
+        captured["model"] = args.model
+        captured["reasoning_effort"] = args.reasoning_effort
+        return ["true"], {}
+
+    monkeypatch.setattr(launcher, "build_command", fake_build_command)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "launcher.py",
+            "--dry-run",
+            "--model",
+            "gpt-5.6-sol",
+            "--reasoning-effort",
+            "ultra",
+        ],
+    )
+
+    assert launcher.main() == 0
+    assert captured == {
+        "model": "gpt-5.6-sol",
+        "reasoning_effort": "ultra",
+    }
     assert capsys.readouterr().out.strip() == "true"
 
 

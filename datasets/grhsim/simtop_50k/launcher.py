@@ -65,6 +65,21 @@ _PLACEHOLDER_RE = re.compile(
 )
 
 
+def _selected_model(args: argparse.Namespace) -> str:
+    """Return the requested model while preserving the dataset's K3 default."""
+    model = getattr(args, "model", MODEL)
+    if not isinstance(model, str) or not model.strip():
+        raise SystemExit("--model must be a non-empty string")
+    return model.strip()
+
+
+def _selected_reasoning_effort(args: argparse.Namespace) -> str:
+    effort = getattr(args, "reasoning_effort", REASONING_EFFORT)
+    if not isinstance(effort, str) or not effort.strip():
+        raise SystemExit("--reasoning-effort must be a non-empty string")
+    return effort.strip()
+
+
 @dataclass(frozen=True)
 class _ValidatedCheckpoint:
     state_dir: Path
@@ -540,6 +555,11 @@ def _validate_preflight_candidate(
 
 def run_codex_preflight(args: argparse.Namespace) -> int:
     """Run a bounded repository-grounded capability smoke without research."""
+    model = _selected_model(args)
+    reasoning_effort = _selected_reasoning_effort(args)
+    is_k3 = model == "k3"
+    output_mode = "local-json" if is_k3 else "provider-structured"
+    tool_choice_mode = "required-first" if is_k3 else "auto"
     target_repo = args.target_repo.expanduser().resolve()
     if not (target_repo / ".git").exists() or not (target_repo / "env.sh").is_file():
         raise SystemExit(f"not a GrhSIM playground checkout: {target_repo}")
@@ -551,7 +571,7 @@ def run_codex_preflight(args: argparse.Namespace) -> int:
     )
     k3_model_catalog = (
         _regular_file(K3_MODEL_CATALOG, "K3 model catalog")
-        if MODEL == "k3"
+        if is_k3
         else None
     )
     max_agent_threads = getattr(
@@ -559,7 +579,7 @@ def run_codex_preflight(args: argparse.Namespace) -> int:
         "codex_max_agent_threads",
         DEFAULT_CODEX_MAX_AGENT_THREADS,
     )
-    if MODEL == "k3" and not 1 <= max_agent_threads <= 32:
+    if is_k3 and not 1 <= max_agent_threads <= 32:
         raise SystemExit("--codex-max-agent-threads must be in 1..32")
     evaluator = _load_evaluator()
     preflight_timeout = getattr(
@@ -581,18 +601,18 @@ def run_codex_preflight(args: argparse.Namespace) -> int:
 
     try:
         client = CodexExecClient(
-            model=MODEL,
-            reasoning_effort=REASONING_EFFORT,
+            model=model,
+            reasoning_effort=reasoning_effort,
             config_path=str(codex_config),
             auth_path=str(codex_auth),
             repo_root=str(target_repo),
             output_schema=str(schema),
             local_validation_schema=str(local_schema),
-            output_mode="local-json",
-            tool_choice_mode="required-first",
+            output_mode=output_mode,
+            tool_choice_mode=tool_choice_mode,
             timeout=float(preflight_timeout),
             max_repair_attempts=0,
-            max_agent_threads=(max_agent_threads if MODEL == "k3" else None),
+            max_agent_threads=(max_agent_threads if is_k3 else None),
             model_catalog_path=(
                 str(k3_model_catalog) if k3_model_catalog is not None else None
             ),
@@ -625,7 +645,7 @@ def run_codex_preflight(args: argparse.Namespace) -> int:
                 "Codex capability preflight failed "
                 f"({error.error_type}): {error.message}"
             ) from None
-        if MODEL == "k3" and any(
+        if is_k3 and any(
             "Model metadata for k3 not found" in diagnostic
             for diagnostic in getattr(result.trace, "diagnostic_summaries", ())
         ):
@@ -636,9 +656,9 @@ def run_codex_preflight(args: argparse.Namespace) -> int:
         client.close()
     print(
         "Codex capability preflight passed: "
-        f"model={MODEL}, effort={REASONING_EFFORT}, "
+        f"model={model}, effort={reasoning_effort}, "
         f"repo_tool_calls={result.trace.repo_tool_call_count}, "
-        f"model_catalog={'validated' if MODEL == 'k3' else 'native'}, "
+        f"model_catalog={'validated' if is_k3 else 'native'}, "
         f"response_chars={len(result.canonical)}, "
         "response_sha256="
         f"{hashlib.sha256(result.canonical.encode('utf-8')).hexdigest()}"
@@ -647,6 +667,11 @@ def run_codex_preflight(args: argparse.Namespace) -> int:
 
 
 def build_command(args: argparse.Namespace) -> tuple[list[str], dict[str, str]]:
+    model = _selected_model(args)
+    reasoning_effort = _selected_reasoning_effort(args)
+    is_k3 = model == "k3"
+    output_mode = "local-json" if is_k3 else "provider-structured"
+    tool_choice_mode = "required-first" if is_k3 else "auto"
     target_repo = args.target_repo.expanduser().resolve()
     if not (target_repo / ".git").exists() or not (target_repo / "env.sh").is_file():
         raise SystemExit(f"not a GrhSIM playground checkout: {target_repo}")
@@ -659,7 +684,7 @@ def build_command(args: argparse.Namespace) -> tuple[list[str], dict[str, str]]:
     )
     k3_model_catalog = (
         _regular_file(K3_MODEL_CATALOG, "K3 model catalog")
-        if MODEL == "k3"
+        if is_k3
         else None
     )
     init_program = _regular_file(args.init_program, "initial program")
@@ -667,7 +692,7 @@ def build_command(args: argparse.Namespace) -> tuple[list[str], dict[str, str]]:
     instruction = _regular_file(TASK_ROOT / "instruction.txt", "instruction")
     k3_instruction_suffix = (
         _regular_file(K3_INSTRUCTION_SUFFIX, "K3 instruction suffix")
-        if MODEL == "k3"
+        if is_k3
         else None
     )
     evaluator_contract = _load_evaluator()
@@ -710,7 +735,7 @@ def build_command(args: argparse.Namespace) -> tuple[list[str], dict[str, str]]:
         "codex_max_agent_threads",
         DEFAULT_CODEX_MAX_AGENT_THREADS,
     )
-    if MODEL == "k3" and not 1 <= max_agent_threads <= 32:
+    if is_k3 and not 1 <= max_agent_threads <= 32:
         raise SystemExit("--codex-max-agent-threads must be in 1..32")
 
     output_path = args.output_path
@@ -741,13 +766,13 @@ def build_command(args: argparse.Namespace) -> tuple[list[str], dict[str, str]]:
         "--codex-local-validation-schema",
         str(local_schema),
         "--codex-output-mode",
-        "local-json",
+        output_mode,
         "--codex-tool-choice-mode",
-        "required-first",
+        tool_choice_mode,
         "--model",
-        MODEL,
+        model,
         "--reasoning-effort",
-        REASONING_EFFORT,
+        reasoning_effort,
         "--selector",
         "rpucg",
         "--num-chains",
@@ -783,7 +808,7 @@ def build_command(args: argparse.Namespace) -> tuple[list[str], dict[str, str]]:
         "--output-path",
         str(output_path),
     ]
-    if MODEL == "k3":
+    if is_k3:
         assert k3_model_catalog is not None
         assert k3_instruction_suffix is not None
         command.extend(
@@ -843,6 +868,16 @@ def main() -> int:
     parser.add_argument("--codex-config", type=Path, default=DEFAULT_CODEX_CONFIG)
     parser.add_argument("--codex-auth", type=Path, default=DEFAULT_CODEX_AUTH)
     parser.add_argument(
+        "--model",
+        default=MODEL,
+        help=f"Codex model for this run (default: {MODEL})",
+    )
+    parser.add_argument(
+        "--reasoning-effort",
+        default=REASONING_EFFORT,
+        help=f"Codex reasoning effort for this run (default: {REASONING_EFFORT})",
+    )
+    parser.add_argument(
         "--init-program",
         type=Path,
         default=DEFAULT_INIT_PROGRAM,
@@ -888,7 +923,7 @@ def main() -> int:
         type=float,
         default=DEFAULT_PREFLIGHT_TIMEOUT,
         help=(
-            "Per-launch deterministic K3 capability-gate timeout; independent "
+            "Per-launch deterministic capability-gate timeout; independent "
             "from the longer research-generation timeout"
         ),
     )
@@ -898,7 +933,7 @@ def main() -> int:
     mode.add_argument(
         "--preflight-only",
         action="store_true",
-        help="Validate K3/provider/auth/schema and exit without creating a research run",
+        help="Validate model/provider/auth/schema and exit without creating a research run",
     )
     args = parser.parse_args()
 

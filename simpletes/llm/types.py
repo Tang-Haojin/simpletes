@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any
 
 
 @dataclass
@@ -31,10 +32,14 @@ class LLMCallError(Exception):
         error_type: str,
         message: str,
         traceback_str: str = "",
+        details: dict[str, Any] | None = None,
+        artifact_paths: tuple[str, ...] = (),
     ) -> None:
         self.model = model
         self.api_base = api_base
         self.error_type = error_type
         self.message = message
         self.traceback_str = traceback_str
+        self.details = dict(details or {})
+        self.artifact_paths = tuple(artifact_paths)
         super().__init__(f"{error_type}: {message}")

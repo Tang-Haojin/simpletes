@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import shutil
+import threading
 from pathlib import Path
 
 import pytest
@@ -227,6 +229,18 @@ def _client(paths: dict[str, Path], **overrides) -> CodexExecClient:
     return CodexExecClient(**kwargs)
 
 
+def _read_attempt_artifact(
+    artifact_root: Path, recorded_path: str
+) -> tuple[Path, dict[str, object], Path, str]:
+    metadata_path = Path(recorded_path)
+    if not metadata_path.is_absolute():
+        metadata_path = artifact_root.parent / metadata_path
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    response_path = metadata_path.parent / str(metadata["stored_response_path"])
+    response = response_path.read_text(encoding="utf-8")
+    return metadata_path, metadata, response_path, response
+
+
 def test_generate_uses_isolated_home_and_structured_output(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -284,6 +298,23 @@ def test_generate_uses_isolated_home_and_structured_output(
     assert "notify=[]" in args
     assert str(paths["auth"]) not in args
     assert "unit-test-secret" not in json.dumps(args)
+
+
+def test_first_attempt_success_does_not_create_repair_artifacts(
+    tmp_path: Path,
+) -> None:
+    paths = _make_inputs(tmp_path)
+    _set_fake(paths, response={"schema_version": 1, "patch": "diff\n"})
+    artifact_root = tmp_path / "checkpoint" / "llm_attempts"
+
+    result = asyncio.run(
+        _client(paths, attempt_artifact_dir=str(artifact_root)).generate(
+            "prompt", track_io=True
+        )
+    )
+
+    assert json.loads(result.raw_output or "")["patch"] == "diff\n"
+    assert not artifact_root.exists()
 
 
 @pytest.mark.parametrize(
@@ -353,6 +384,215 @@ def test_generate_repairs_schema_failure_and_saves_sanitized_trace(
     assert "'patch' is a required property" in repair_prompt
     assert repair_prompt.startswith("inspect repo\n\n")
     assert raw_event_payload not in (result.raw_output or "")
+
+
+def test_invalid_json_repair_preserves_full_response_and_exact_location(
+    tmp_path: Path,
+) -> None:
+    paths = _make_inputs(tmp_path)
+    raw = (
+        '{\n  "start": "START-SENTINEL-'
+        + ("x" * 2600)
+        + '",\n  "schema_version": 1,\n  "patch": "中文-tail"\n'
+        '  "end": "END-SENTINEL"\n}\n'
+    )
+    with pytest.raises(json.JSONDecodeError) as expected:
+        json.loads(raw)
+    _set_fake_sequence(
+        paths,
+        [
+            {"raw": raw},
+            {"response": {"schema_version": 1, "patch": "real diff\n"}},
+        ],
+    )
+    artifact_root = tmp_path / "checkpoint" / "llm_attempts"
+
+    result = asyncio.run(
+        _client(paths, attempt_artifact_dir=str(artifact_root)).generate(
+            "inspect repo", instance_id="instance/../unsafe", track_io=True
+        )
+    )
+    tracked = json.loads(result.raw_output or "")
+    repair_prompt = json.loads(
+        (tmp_path / "invocation-1.json").read_text(encoding="utf-8")
+    )["prompt"]
+    artifact_paths = tracked["simpletes_codex_rejected_response_artifacts"]
+
+    assert len(artifact_paths) == 1
+    assert not Path(artifact_paths[0]).is_absolute()
+    artifact_path, artifact, response_path, stored_response = _read_attempt_artifact(
+        artifact_root, artifact_paths[0]
+    )
+    decode_error = artifact["error_details"]["json_decode_error"]
+    assert stored_response == raw
+    assert artifact["stored_response_complete"] is True
+    assert artifact["raw_response_persisted"] is True
+    assert artifact["redaction_count"] == 0
+    assert artifact["instance_id"] == "instance_.._unsafe"
+    assert artifact["prompt_sha256"] == hashlib.sha256(
+        b"inspect repo"
+    ).hexdigest()
+    assert artifact["raw_response_sha256"] == hashlib.sha256(
+        raw.encode("utf-8")
+    ).hexdigest()
+    assert decode_error == {
+        "message": expected.value.msg,
+        "line": expected.value.lineno,
+        "column": expected.value.colno,
+        "character_offset": expected.value.pos,
+        "utf8_byte_offset": len(raw[: expected.value.pos].encode("utf-8")),
+    }
+    assert artifact["stored_json_decode_error_location"] == {
+        "line": expected.value.lineno,
+        "column": expected.value.colno,
+        "character_offset": expected.value.pos,
+        "utf8_byte_offset": len(raw[: expected.value.pos].encode("utf-8")),
+    }
+    assert raw in repair_prompt
+    assert "----- BEGIN COMPLETE REJECTED FINAL RESPONSE -----" in repair_prompt
+    assert "----- END COMPLETE REJECTED FINAL RESPONSE -----" in repair_prompt
+    assert f"line {expected.value.lineno}" in repair_prompt
+    assert f"column {expected.value.colno}" in repair_prompt
+    assert f"character offset {expected.value.pos}" in repair_prompt
+    assert artifact_root.stat().st_mode & 0o777 == 0o700
+    assert artifact_path.parent.stat().st_mode & 0o777 == 0o700
+    assert artifact_path.stat().st_mode & 0o777 == 0o600
+    assert response_path.stat().st_mode & 0o777 == 0o600
+    first_home = Path(
+        json.loads(
+            (tmp_path / "invocation-0.json").read_text(encoding="utf-8")
+        )["home"]
+    )
+    assert not first_home.exists()
+    assert artifact_path.exists()
+    assert response_path.exists()
+
+
+def test_exhausted_repairs_persist_every_rejected_response(tmp_path: Path) -> None:
+    paths = _make_inputs(tmp_path)
+    raw_responses = [
+        f'{{\n  "schema_version": 1,\n  "patch": "attempt-{index}"\n  "marker": "BROKEN-{index}"\n}}'
+        for index in range(1, 4)
+    ]
+    _set_fake_sequence(paths, [{"raw": raw} for raw in raw_responses])
+    artifact_root = tmp_path / "checkpoint" / "llm_attempts"
+
+    with pytest.raises(LLMCallError) as raised:
+        asyncio.run(
+            _client(paths, attempt_artifact_dir=str(artifact_root)).generate(
+                "prompt", instance_id="same-instance", track_io=True
+            )
+        )
+
+    assert raised.value.error_type == "InvalidJSON"
+    assert len(raised.value.artifact_paths) == 3
+    assert paths["counter"].read_text(encoding="utf-8") == "3"
+    assert "BROKEN-" not in raised.value.message
+    artifacts_with_responses = [
+        _read_attempt_artifact(artifact_root, path)
+        for path in raised.value.artifact_paths
+    ]
+    artifacts = [entry[1] for entry in artifacts_with_responses]
+    assert [artifact["attempt"] for artifact in artifacts] == [1, 2, 3]
+    assert [entry[3] for entry in artifacts_with_responses] == raw_responses
+    assert len({Path(path).name for path in raised.value.artifact_paths}) == 3
+    assert len({Path(path).parent for path in raised.value.artifact_paths}) == 1
+
+
+def test_concurrent_exhausted_repairs_use_distinct_request_directories(
+    tmp_path: Path,
+) -> None:
+    paths = _make_inputs(tmp_path)
+    raw = '{\n  "schema_version": 1,\n  "patch": "parallel"\n  BROKEN\n}'
+    _set_fake(paths, raw=raw)
+    artifact_root = tmp_path / "checkpoint" / "llm_attempts"
+    client = _client(paths, attempt_artifact_dir=str(artifact_root))
+
+    async def run_four() -> list[object]:
+        return await asyncio.gather(
+            *(
+                client.generate(
+                    f"prompt-{index}",
+                    instance_id="same-instance",
+                    track_io=True,
+                )
+                for index in range(4)
+            ),
+            return_exceptions=True,
+        )
+
+    results = asyncio.run(run_four())
+
+    assert all(isinstance(result, LLMCallError) for result in results)
+    errors = [result for result in results if isinstance(result, LLMCallError)]
+    request_directories = {
+        Path(error.artifact_paths[0]).parent for error in errors
+    }
+    all_artifacts = [path for error in errors for path in error.artifact_paths]
+    assert len(errors) == 4
+    assert all(len(error.artifact_paths) == 3 for error in errors)
+    assert len(request_directories) == 4
+    assert len(set(all_artifacts)) == 12
+    assert paths["counter"].read_text(encoding="utf-8") == "12"
+    assert all(
+        _read_attempt_artifact(artifact_root, path)[3] == raw
+        for path in all_artifacts
+    )
+
+
+def test_metadata_write_failure_keeps_response_artifact_reference(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    paths = _make_inputs(tmp_path)
+    rejected = '{\n  "schema_version": 1\n  BROKEN\n}'
+    _set_fake(paths, raw=rejected)
+    artifact_root = tmp_path / "checkpoint" / "llm_attempts"
+    client = _client(paths, attempt_artifact_dir=str(artifact_root))
+
+    def fail_metadata(_path: Path, _value: dict[str, object]) -> None:
+        raise client._error("CodexAuditError", "metadata write failed")
+
+    monkeypatch.setattr(client, "_atomic_write_private_json", fail_metadata)
+
+    with pytest.raises(LLMCallError) as raised:
+        asyncio.run(client.generate("prompt", track_io=True))
+
+    assert raised.value.error_type == "CodexAuditError"
+    assert len(raised.value.artifact_paths) == 1
+    response_path = artifact_root.parent / raised.value.artifact_paths[0]
+    assert response_path.name == "attempt-01.response.txt"
+    assert response_path.read_text(encoding="utf-8") == rejected
+    assert response_path.stat().st_mode & 0o777 == 0o600
+    assert not list(response_path.parent.glob("*.metadata.json"))
+
+
+def test_repair_artifact_fsync_is_offloaded_from_event_loop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    paths = _make_inputs(tmp_path)
+    _set_fake_sequence(
+        paths,
+        [
+            {"raw": '{"schema_version": 1 "patch": "broken"}'},
+            {"response": {"schema_version": 1, "patch": "fixed\n"}},
+        ],
+    )
+    artifact_root = tmp_path / "checkpoint" / "llm_attempts"
+    client = _client(paths, attempt_artifact_dir=str(artifact_root))
+    event_loop_thread = threading.get_ident()
+    persistence_threads: list[int] = []
+    real_persist = client._persist_rejected_response
+
+    def record_thread(**kwargs):
+        persistence_threads.append(threading.get_ident())
+        return real_persist(**kwargs)
+
+    monkeypatch.setattr(client, "_persist_rejected_response", record_thread)
+
+    asyncio.run(client.generate("prompt", track_io=True))
+
+    assert len(persistence_threads) == 1
+    assert persistence_threads[0] != event_loop_thread
 
 
 def test_local_validation_overlay_repairs_provider_schema_valid_response(
@@ -549,27 +789,112 @@ def test_generate_repairs_semantically_rejected_response(tmp_path: Path) -> None
 def test_repair_prompt_and_trace_redact_secret_shaped_text(tmp_path: Path) -> None:
     paths = _make_inputs(tmp_path)
     secret_shaped = "sk-provider-accidental-secret"
+    rejected = json.dumps(
+        {
+            "schema_version": 2,
+            "patch": f"before\n{secret_shaped}\nafter",
+        },
+        ensure_ascii=False,
+        indent=2,
+    )
     _set_fake_sequence(
         paths,
         [
-            {
-                "response": {
-                    "schema_version": 2,
-                    "patch": secret_shaped,
-                }
-            },
+            {"raw": rejected},
             {"response": {"schema_version": 1, "patch": "real diff\n"}},
         ],
     )
+    artifact_root = tmp_path / "checkpoint" / "llm_attempts"
 
-    result = asyncio.run(_client(paths).generate("prompt", track_io=True))
+    result = asyncio.run(
+        _client(paths, attempt_artifact_dir=str(artifact_root)).generate(
+            "prompt", track_io=True
+        )
+    )
     repair_prompt = json.loads(
         (tmp_path / "invocation-1.json").read_text(encoding="utf-8")
     )["prompt"]
+    tracked = json.loads(result.raw_output or "")
+    _, artifact, _, stored_response = _read_attempt_artifact(
+        artifact_root,
+        tracked["simpletes_codex_rejected_response_artifacts"][0],
+    )
+    masked_response = rejected.replace(secret_shaped, "*" * len(secret_shaped))
 
     assert secret_shaped not in repair_prompt
-    assert "[REDACTED]" in repair_prompt
+    assert masked_response in repair_prompt
     assert secret_shaped not in (result.raw_output or "")
+    assert stored_response == masked_response
+    assert len(stored_response) == len(rejected)
+    assert artifact["redaction_count"] == 1
+    assert artifact["raw_response_sha256"] is None
+    assert artifact["raw_response_persisted"] is False
+    assert hashlib.sha256(rejected.encode("utf-8")).hexdigest() not in repair_prompt
+
+
+def test_auth_material_is_not_persisted_as_a_repair_artifact(
+    tmp_path: Path,
+) -> None:
+    paths = _make_inputs(tmp_path)
+    _set_fake(
+        paths,
+        response={
+            "schema_version": 2,
+            "patch": "unit-test-secret",
+        },
+    )
+    artifact_root = tmp_path / "checkpoint" / "llm_attempts"
+
+    with pytest.raises(LLMCallError) as raised:
+        asyncio.run(
+            _client(paths, attempt_artifact_dir=str(artifact_root)).generate("prompt")
+        )
+
+    assert raised.value.error_type == "SensitiveOutput"
+    assert raised.value.artifact_paths == ()
+    assert paths["counter"].read_text(encoding="utf-8") == "1"
+    assert not artifact_root.exists()
+
+
+def test_redacted_unicode_response_records_stored_json_byte_offset(
+    tmp_path: Path,
+) -> None:
+    paths = _make_inputs(tmp_path)
+    rejected = (
+        '{\n  "schema_version": 1,\n  "patch": "password=中文"\n'
+        '  "extra": true\n}\n'
+    )
+    _set_fake_sequence(
+        paths,
+        [
+            {"raw": rejected},
+            {"response": {"schema_version": 1, "patch": "fixed\n"}},
+        ],
+    )
+    artifact_root = tmp_path / "checkpoint" / "llm_attempts"
+
+    result = asyncio.run(
+        _client(paths, attempt_artifact_dir=str(artifact_root)).generate(
+            "prompt", track_io=True
+        )
+    )
+    tracked = json.loads(result.raw_output or "")
+    _, metadata, _, stored_response = _read_attempt_artifact(
+        artifact_root,
+        tracked["simpletes_codex_rejected_response_artifacts"][0],
+    )
+    raw_location = metadata["error_details"]["json_decode_error"]
+    stored_location = metadata["stored_json_decode_error_location"]
+
+    assert "中文" not in stored_response
+    assert "password=**" in stored_response
+    assert stored_location["line"] == raw_location["line"]
+    assert stored_location["column"] == raw_location["column"]
+    assert stored_location["character_offset"] == raw_location["character_offset"]
+    assert stored_location["utf8_byte_offset"] == len(
+        stored_response[: stored_location["character_offset"]].encode("utf-8")
+    )
+    assert stored_location["utf8_byte_offset"] < raw_location["utf8_byte_offset"]
 
 
 def test_capability_probe_returns_repo_tool_trace_and_canonical_value(
@@ -948,6 +1273,19 @@ def test_codex_tool_choice_mode_must_be_known(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="tool_choice_mode must be one of"):
         _client(paths, tool_choice_mode="unknown-mode")
+
+
+def test_codex_attempt_artifact_root_rejects_symbolic_link(
+    tmp_path: Path,
+) -> None:
+    paths = _make_inputs(tmp_path)
+    real_directory = tmp_path / "real-artifacts"
+    real_directory.mkdir()
+    artifact_link = tmp_path / "artifact-link"
+    artifact_link.symlink_to(real_directory, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="must not be a symbolic link"):
+        _client(paths, attempt_artifact_dir=str(artifact_link))
 
 
 def test_codex_agent_thread_limit_is_validated_and_forwarded(tmp_path: Path) -> None:

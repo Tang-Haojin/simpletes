@@ -164,6 +164,7 @@ class Generator:
         instruction: str,
         evolve_context: EvolveBlockContext,
         available_packages: list[str] | None = None,
+        codex_attempt_artifact_dir: str | None = None,
     ) -> None:
         self._config = config
         self._instruction = instruction
@@ -176,7 +177,10 @@ class Generator:
             self._code_fence_tag,
         )
 
-        self._llm: LLMBackend = create_llm_client(config)
+        self._llm: LLMBackend = create_llm_client(
+            config,
+            codex_attempt_artifact_dir=codex_attempt_artifact_dir,
+        )
 
     @staticmethod
     def _resolve_code_fence_tag(init_program_path: str) -> str:
@@ -383,8 +387,14 @@ class Generator:
         Returns a list of GenerationResult, one per LLM response.
         May return fewer than task.k results if LLM fails.
         """
+        request_instance_id = (
+            f"{instance_id}-gen{task.gen_id}-chain{task.chain_idx}"
+        )
         llm_results = await self._llm.generate_batch(
-            task.prompt, n=task.k, instance_id=instance_id, track_io=track_io
+            task.prompt,
+            n=task.k,
+            instance_id=request_instance_id,
+            track_io=track_io,
         )
 
         results: list[GenerationResult] = []

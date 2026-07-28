@@ -42,7 +42,11 @@ class LLMBackend(Protocol):
     def close(self) -> None: ...
 
 
-def create_llm_client(config: EngineConfig) -> LLMBackend:
+def create_llm_client(
+    config: EngineConfig,
+    *,
+    codex_attempt_artifact_dir: str | None = None,
+) -> LLMBackend:
     """Pick and instantiate the LLM backend declared by ``config.llm_backend``."""
     if config.llm_backend == "codex_exec":
         missing = [
@@ -71,6 +75,7 @@ def create_llm_client(config: EngineConfig) -> LLMBackend:
             tool_choice_mode=config.codex_tool_choice_mode,
             max_agent_threads=config.codex_max_agent_threads,
             model_catalog_path=config.codex_model_catalog_path,
+            attempt_artifact_dir=codex_attempt_artifact_dir,
             timeout=config.timeout,
             pool_size=config.gen_concurrency,
         )

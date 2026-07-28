@@ -17,10 +17,11 @@ _INITIAL_SHARED_CONSTRUCTION_ENV = "SIMPLETES_INITIAL_SHARED_CONSTRUCTION_PATH"
 _RETRYABLE_EVAL_DEFAULT_DELAY_SEC = 30.0
 _RETRYABLE_EVAL_MAX_DELAY_SEC = 300.0
 
-from datetime import datetime
+from datetime import datetime, timezone
 import asyncio
 from functools import lru_cache
 import importlib.util
+import json
 import math
 import os
 import signal
@@ -231,12 +232,36 @@ class SimpleTESEngine(SchedulerMixin):
             )
             raise SystemExit(2)
 
+        # Resolve the durable instance directory before constructing the LLM
+        # backend. Rejected Codex responses are written outside rotating
+        # db_state_* snapshots so repair evidence survives retries and crashes.
+        if self._resume_path:
+            self.checkpoint_dir = self._resolve_resume_checkpoint_dir(
+                self._resume_path
+            )
+        else:
+            date_str = datetime.now().strftime("%Y-%m-%d")
+            self.checkpoint_dir = os.path.join(
+                config.output_path,
+                date_str,
+                f"instance-{self.instance_id}",
+            )
+        self._shared_construction_dir = os.path.join(
+            self.checkpoint_dir, "shared_constructions"
+        )
+        os.makedirs(self._shared_construction_dir, exist_ok=True)
+
         # Generator handles LLM lifecycle, prompt building, code extraction
         self.generator = Generator(
             config=config,
             instruction=self.instruction,
             evolve_context=self._evolve_context,
             available_packages=self._available_packages,
+            codex_attempt_artifact_dir=(
+                os.path.join(self.checkpoint_dir, "llm_attempts")
+                if config.llm_backend == "codex_exec" and config.save_llm_io
+                else None
+            ),
         )
         self._stop_event = asyncio.Event()
         self._progress_event = asyncio.Event()
@@ -246,15 +271,6 @@ class SimpleTESEngine(SchedulerMixin):
         self._gen_workers: list[asyncio.Task] = []
         self._eval_workers: list[asyncio.Task] = []
 
-        # Checkpoints - use date-based directory structure
-        # If resuming, use the instance directory from resume_path
-        if self._resume_path:
-            self.checkpoint_dir = self._resolve_resume_checkpoint_dir(self._resume_path)
-        else:
-            date_str = datetime.now().strftime("%Y-%m-%d")
-            self.checkpoint_dir = os.path.join(config.output_path, date_str, f"instance-{self.instance_id}")
-        self._shared_construction_dir = os.path.join(self.checkpoint_dir, "shared_constructions")
-        os.makedirs(self._shared_construction_dir, exist_ok=True)
         self.checkpoint_manager = CheckpointManager(
             config=config, instance_id=self.instance_id, checkpoint_dir=self.checkpoint_dir,
         )
@@ -696,8 +712,39 @@ class SimpleTESEngine(SchedulerMixin):
             rich_print(f"   [dim]API base: [/dim]{e.api_base or '(provider default)'}")
             rich_print(f"   [dim]Error:    [/dim][red]{e.error_type}[/red]")
             rich_print(f"   [dim]Message:  [/dim]{e.message}")
+            artifact_paths = list(e.artifact_paths)
+            if artifact_paths:
+                rich_print(
+                    "   [dim]Repair artifacts (checkpoint-relative):[/dim] "
+                    + ", ".join(artifact_paths)
+                )
             async with self._counter_lock:
                 self.generation_failures += 1
+                if track_io and self.config.llm_backend == "codex_exec":
+                    self._failure_records.append({
+                        "type": "generation",
+                        "reason": f"{e.error_type}: {e.message}",
+                        "error_type": e.error_type,
+                        "error_details": e.details,
+                        "artifact_paths": artifact_paths,
+                        "llm_input": task.prompt if track_io else None,
+                        "llm_output": (
+                            json.dumps(
+                                {
+                                    "simpletes_codex_rejected_response_artifacts":
+                                        artifact_paths
+                                },
+                                ensure_ascii=False,
+                                sort_keys=True,
+                            )
+                            if artifact_paths
+                            else None
+                        ),
+                        "gen_id": task.gen_id,
+                        "chain_idx": task.chain_idx,
+                        "shared_construction_id": task.shared_construction_id,
+                        "created_at": datetime.now(timezone.utc).isoformat(),
+                    })
             results = []
         except Exception as e:
             rich_print(self._log("⚠", f"[red]Generation failed: {type(e).__name__}: {str(e)}[/red]"))

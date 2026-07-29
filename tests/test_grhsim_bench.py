@@ -1956,6 +1956,7 @@ def test_launcher_uses_fixed_model_parallel_generation_and_only_secret_file_path
     assert "--max-generations 16" in rendered
     assert "--eval-concurrency 1" in rendered
     assert "--gen-concurrency 4" in rendered
+    assert "--retry 2" in rendered
     assert "--codex-max-agent-threads 3" in rendered
     assert "--codex-model-catalog" in rendered
     assert "--instruction-suffix" in rendered
@@ -2083,6 +2084,13 @@ def test_launcher_accepts_long_bounded_continuation_and_rejects_oversize_budget(
         launcher.build_command(args)
 
     args.codex_max_agent_threads = launcher.DEFAULT_CODEX_MAX_AGENT_THREADS
+    args.codex_exec_retries = -1
+    with pytest.raises(
+        SystemExit,
+        match=r"--codex-exec-retries must be in 0\.\.3",
+    ):
+        launcher.build_command(args)
+    args.codex_exec_retries = launcher.DEFAULT_CODEX_EXEC_RETRIES
     args.max_proposals = launcher.MAX_PROPOSALS + 1
     with pytest.raises(SystemExit, match=r"--max-proposals must be in 1\.\.64"):
         launcher.build_command(args)
@@ -2602,6 +2610,13 @@ def test_launcher_capability_preflight_is_repo_grounded_and_research_free(
     assert captured["kwargs"]["timeout"] == 600.0
     assert captured["kwargs"]["max_repair_attempts"] == 0
     assert captured["kwargs"]["max_agent_threads"] == 3
+    assert captured["kwargs"]["max_exec_retries"] == 2
+    assert captured["kwargs"]["attempt_artifact_dir"] == str(
+        launcher.PREFLIGHT_ATTEMPT_ARTIFACT_ROOT
+    )
+    assert captured["kwargs"]["runtime_home_dir"] == str(
+        launcher.PREFLIGHT_RUNTIME_HOME_ROOT
+    )
     assert captured["kwargs"]["model_catalog_path"] == str(
         launcher.K3_MODEL_CATALOG.resolve()
     )

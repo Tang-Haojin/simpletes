@@ -6,10 +6,12 @@ fresh, private ``CODEX_HOME`` containing only the selected configuration.  The
 API key is read from the selected auth JSON.  Normal requests pass it only to
 the parent Codex process; required-first compatibility requests retain it in a
 loopback proxy and give Codex an unrelated proxy credential.  Generated tool
-shells inherit no parent environment.  The directory is removed as soon as the
-request finishes.  When LLM I/O tracking is enabled, rejected final responses
-are persisted separately as private, structure-preserving repair artifacts;
-authentication material itself is never persisted.
+shells inherit no parent environment.  The home is created below a private,
+stable runtime root when one is available and is removed as soon as the request
+finishes.  When LLM I/O tracking is enabled, rejected final responses and
+non-zero/timeout subprocess logs are persisted separately as private,
+structure-preserving artifacts; authentication material itself is never
+persisted.
 """
 from __future__ import annotations
 
@@ -84,6 +86,9 @@ _CLEANUP_RETRY_DELAYS = (0.0, 0.02, 0.05, 0.1, 0.2)
 _MAX_CODEX_STDOUT_BYTES = 8 * 1024 * 1024
 _MAX_CODEX_STDERR_BYTES = 1024 * 1024
 _MAX_FINAL_OUTPUT_BYTES = 4 * 1024 * 1024
+_MAX_CODEX_FAILURE_ARTIFACT_BYTES = 64 * 1024 * 1024
+_MAX_EXEC_RETRIES = 3
+_EXEC_RETRY_DELAYS = (1.0, 4.0, 12.0)
 _OUTPUT_MODES = frozenset({"provider-structured", "local-json"})
 _DEFAULT_OUTPUT_MODE = "provider-structured"
 _TOOL_CHOICE_MODES = frozenset({"auto", "required-first"})
@@ -93,6 +98,43 @@ _REPO_TOOL_ITEM_TYPES = frozenset(
 )
 _COLLABORATION_TOOL_NAMES = frozenset(
     {"spawn_agent", "send_input", "wait", "close_agent"}
+)
+_NON_RETRYABLE_EXEC_DIAGNOSTICS = (
+    "unauthorized",
+    "authentication failed",
+    "invalid api key",
+    "permission denied",
+    "not permitted",
+    "policy violation",
+    "invalid request",
+    "schema validation",
+    "status 400",
+    "status 401",
+    "status 403",
+    "status 404",
+)
+_RETRYABLE_EXEC_DIAGNOSTICS = (
+    "failed to create unified exec process",
+    "unified exec process failed",
+    "no such file or directory (os error 2)",
+    "connection reset",
+    "connection closed",
+    "connection refused",
+    "broken pipe",
+    "transport error",
+    "websocket",
+    "temporarily unavailable",
+    "service unavailable",
+    "internal server error",
+    "bad gateway",
+    "gateway timeout",
+    "rate limit",
+    "too many requests",
+    "status 429",
+    "status 500",
+    "status 502",
+    "status 503",
+    "status 504",
 )
 
 
@@ -143,6 +185,61 @@ class _AttemptTrace:
     collaboration_tool_call_counts: tuple[tuple[str, int], ...]
     diagnostics: tuple[str, ...]
 
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "event_count": self.event_count,
+            "repo_tool_call_count": self.repo_tool_call_count,
+            "repo_tool_types": list(self.repo_tool_types),
+            "collaboration_tool_call_count": self.collaboration_tool_call_count,
+            "collaboration_tool_call_counts": dict(
+                self.collaboration_tool_call_counts
+            ),
+            "diagnostics": list(self.diagnostics),
+        }
+
+    @classmethod
+    def from_dict(cls, value: Any) -> _AttemptTrace | None:
+        if not isinstance(value, dict):
+            return None
+        try:
+            event_count = value["event_count"]
+            repo_tool_call_count = value["repo_tool_call_count"]
+            repo_tool_types = value["repo_tool_types"]
+            collaboration_tool_call_count = value[
+                "collaboration_tool_call_count"
+            ]
+            collaboration_tool_call_counts = value[
+                "collaboration_tool_call_counts"
+            ]
+            diagnostics = value["diagnostics"]
+            if (
+                type(event_count) is not int
+                or type(repo_tool_call_count) is not int
+                or not isinstance(repo_tool_types, list)
+                or not all(isinstance(item, str) for item in repo_tool_types)
+                or type(collaboration_tool_call_count) is not int
+                or not isinstance(collaboration_tool_call_counts, dict)
+                or not all(
+                    isinstance(name, str) and type(count) is int
+                    for name, count in collaboration_tool_call_counts.items()
+                )
+                or not isinstance(diagnostics, list)
+                or not all(isinstance(item, str) for item in diagnostics)
+            ):
+                return None
+            return cls(
+                event_count=event_count,
+                repo_tool_call_count=repo_tool_call_count,
+                repo_tool_types=tuple(repo_tool_types),
+                collaboration_tool_call_count=collaboration_tool_call_count,
+                collaboration_tool_call_counts=tuple(
+                    sorted(collaboration_tool_call_counts.items())
+                ),
+                diagnostics=tuple(diagnostics),
+            )
+        except KeyError:
+            return None
+
 
 @dataclass(frozen=True)
 class _ProviderOverride:
@@ -177,6 +274,8 @@ class CodexExecClient:
         max_agent_threads: int | None = None,
         model_catalog_path: str | None = None,
         attempt_artifact_dir: str | None = None,
+        runtime_home_dir: str | None = None,
+        max_exec_retries: int = 0,
     ) -> None:
         del pool_size  # The engine owns generation concurrency.
         self.model = model
@@ -227,6 +326,17 @@ class CodexExecClient:
             if attempt_artifact_dir is not None
             else None
         )
+        self.runtime_home_root = (
+            self._resolve_runtime_root(Path(runtime_home_dir))
+            if runtime_home_dir is not None
+            else (
+                self._resolve_runtime_root(
+                    self.attempt_artifact_root.parent / ".codex_runtime"
+                )
+                if self.attempt_artifact_root is not None
+                else None
+            )
+        )
         if (
             type(max_repair_attempts) is not int
             or not 0 <= max_repair_attempts <= _MAX_REPAIR_ATTEMPTS
@@ -235,6 +345,14 @@ class CodexExecClient:
                 f"Codex max_repair_attempts must be in 0..{_MAX_REPAIR_ATTEMPTS}"
             )
         self.max_repair_attempts = max_repair_attempts
+        if (
+            type(max_exec_retries) is not int
+            or not 0 <= max_exec_retries <= _MAX_EXEC_RETRIES
+        ):
+            raise ValueError(
+                f"Codex max_exec_retries must be in 0..{_MAX_EXEC_RETRIES}"
+            )
+        self.max_exec_retries = max_exec_retries
         self._response_validator = response_validator
 
         self._validate_inputs()
@@ -286,6 +404,20 @@ class CodexExecClient:
             raise ValueError(
                 "Codex attempt artifact path must be a directory: "
                 f"{expanded}"
+            )
+        return expanded
+
+    @staticmethod
+    def _resolve_runtime_root(path: Path) -> Path:
+        expanded = path.expanduser().absolute()
+        if expanded.is_symlink():
+            raise ValueError(
+                "Codex runtime home directory must not be a symbolic link: "
+                f"{expanded}"
+            )
+        if expanded.exists() and not expanded.is_dir():
+            raise ValueError(
+                "Codex runtime home path must be a directory: " f"{expanded}"
             )
         return expanded
 
@@ -745,6 +877,162 @@ class CodexExecClient:
         return request_dir, str(relative_metadata_path)
 
     @staticmethod
+    def _read_complete_failure_file(path: Path) -> bytes:
+        mode = path.lstat().st_mode
+        if not stat.S_ISREG(mode):
+            raise OSError("Codex failure artifact source is not a regular file")
+        size = path.stat().st_size
+        if size > _MAX_CODEX_FAILURE_ARTIFACT_BYTES:
+            raise OSError(
+                "Codex failure artifact exceeded the complete persistence limit"
+            )
+        with path.open("rb") as stream:
+            raw = stream.read(_MAX_CODEX_FAILURE_ARTIFACT_BYTES + 1)
+        if len(raw) > _MAX_CODEX_FAILURE_ARTIFACT_BYTES:
+            raise OSError(
+                "Codex failure artifact exceeded the complete persistence limit"
+            )
+        return raw
+
+    def _persist_failure_file(
+        self,
+        *,
+        source_path: Path,
+        destination_path: Path,
+        temporary_secrets: frozenset[str],
+    ) -> dict[str, Any] | None:
+        if not source_path.exists():
+            return None
+        raw = self._read_complete_failure_file(source_path)
+        decoded = raw.decode("utf-8", errors="replace")
+        decoded_exactly = decoded.encode("utf-8") == raw
+        sanitized, redaction_count = self._sanitize_response_preserving_layout(
+            decoded, temporary_secrets=temporary_secrets
+        )
+        stored = sanitized.encode("utf-8")
+        self._atomic_write_private_bytes(destination_path, stored)
+        return {
+            "source_utf8_bytes": len(raw),
+            "raw_source_sha256": (
+                hashlib.sha256(raw).hexdigest()
+                if decoded_exactly and redaction_count == 0
+                else None
+            ),
+            "stored_utf8_bytes": len(stored),
+            "stored_sha256": hashlib.sha256(stored).hexdigest(),
+            "stored_complete": True,
+            "raw_source_persisted": decoded_exactly and redaction_count == 0,
+            "utf8_decoded_exactly": decoded_exactly,
+            "redaction_count": redaction_count,
+            "stored_path": destination_path.name,
+        }
+
+    def _persist_exec_failure(
+        self,
+        *,
+        request_dir: Path | None,
+        request_id: str,
+        instance_id: str,
+        structured_attempt: int,
+        exec_attempt: int,
+        stdout_path: Path,
+        stderr_path: Path,
+        output_path: Path,
+        temporary_secrets: frozenset[str],
+        error: LLMCallError,
+        prompt_sha256: str,
+        exit_status: int | None,
+    ) -> tuple[Path | None, str | None]:
+        """Persist complete, redacted subprocess evidence before HOME cleanup."""
+        if self.attempt_artifact_root is None:
+            return request_dir, None
+        if request_dir is None:
+            request_dir = self._create_request_artifact_directory(request_id)
+        stem = (
+            f"attempt-{structured_attempt:02d}.exec-{exec_attempt:02d}"
+        )
+        source_specs = (
+            ("events", stdout_path, request_dir / f"{stem}.events.jsonl"),
+            ("stderr", stderr_path, request_dir / f"{stem}.stderr.log"),
+            ("final_output", output_path, request_dir / f"{stem}.final-output.txt"),
+        )
+        stored_artifacts: dict[str, dict[str, Any]] = {}
+        relative_stored_paths: list[str] = []
+        try:
+            for label, source_path, destination_path in source_specs:
+                metadata = self._persist_failure_file(
+                    source_path=source_path,
+                    destination_path=destination_path,
+                    temporary_secrets=temporary_secrets,
+                )
+                if metadata is None:
+                    continue
+                stored_artifacts[label] = metadata
+                relative_stored_paths.append(
+                    str(
+                        destination_path.relative_to(
+                            self.attempt_artifact_root.parent
+                        )
+                    )
+                )
+        except (OSError, LLMCallError) as artifact_error:
+            message = (
+                "Codex could not persist a complete subprocess failure artifact"
+            )
+            if relative_stored_paths:
+                message += "; earlier complete artifacts remain checkpoint-relative"
+            raise self._error(
+                "CodexAuditError",
+                message,
+                details={
+                    "original_error_type": error.error_type,
+                    "original_error_details": error.details,
+                },
+                artifact_paths=tuple(relative_stored_paths),
+            ) from artifact_error
+
+        metadata_path = request_dir / f"{stem}.metadata.json"
+        try:
+            self._atomic_write_private_json(
+                metadata_path,
+                {
+                    "schema_version": 1,
+                    "artifact_kind": "codex_subprocess_failure",
+                    "request_id": request_id,
+                    "instance_id": self._safe_artifact_label(instance_id),
+                    "prompt_sha256": prompt_sha256,
+                    "model": self.model,
+                    "reasoning_effort": self.reasoning_effort,
+                    "structured_attempt": structured_attempt,
+                    "exec_attempt": exec_attempt,
+                    "created_at": datetime.now(timezone.utc).isoformat(),
+                    "error_type": error.error_type,
+                    "error_message": self._safe_diagnostic(
+                        error.message.encode("utf-8"),
+                        temporary_secrets=temporary_secrets,
+                    ),
+                    "error_details": error.details,
+                    "exit_status": exit_status,
+                    "stored_artifacts": stored_artifacts,
+                },
+            )
+        except LLMCallError as metadata_error:
+            raise self._error(
+                metadata_error.error_type,
+                metadata_error.message
+                + "; complete subprocess logs remain at checkpoint-relative paths",
+                details={
+                    "original_error_type": error.error_type,
+                    "original_error_details": error.details,
+                },
+                artifact_paths=tuple(relative_stored_paths),
+            ) from metadata_error
+        relative_metadata_path = metadata_path.relative_to(
+            self.attempt_artifact_root.parent
+        )
+        return request_dir, str(relative_metadata_path)
+
+    @staticmethod
     def _read_bounded_file(
         path: Path, limit: int, *, tail: bool = False
     ) -> tuple[bytes, bool]:
@@ -783,7 +1071,7 @@ class CodexExecClient:
         *,
         temporary_secrets: frozenset[str] = frozenset(),
     ) -> _AttemptTrace:
-        """Reduce Codex JSONL to counts/types; never retain event payloads."""
+        """Reduce JSONL to counts/types and bounded, scrubbed error summaries."""
         event_count = 0
         tool_ids: set[str] = set()
         tool_types: set[str] = set()
@@ -814,7 +1102,27 @@ class CodexExecClient:
                     )
                 continue
             event_count += 1
-            if event.get("type") not in {"item.started", "item.completed"}:
+            event_type = event.get("type")
+            if event_type in {"error", "turn.failed", "thread.failed"}:
+                error_payload = event.get("error", event.get("message"))
+                if error_payload is not None and len(diagnostics) < 8:
+                    if isinstance(error_payload, str):
+                        error_text = error_payload
+                    else:
+                        try:
+                            error_text = json.dumps(
+                                error_payload,
+                                ensure_ascii=False,
+                                sort_keys=True,
+                            )
+                        except (TypeError, ValueError):
+                            error_text = type(error_payload).__name__
+                    safe_error = self._safe_diagnostic(
+                        error_text.encode("utf-8"),
+                        temporary_secrets=temporary_secrets,
+                    )
+                    diagnostics.append(f"{event_type}: {safe_error}")
+            if event_type not in {"item.started", "item.completed"}:
                 continue
             item = event.get("item")
             if not isinstance(item, dict):
@@ -862,6 +1170,31 @@ class CodexExecClient:
             ),
             diagnostics=tuple(diagnostics[:8]),
         )
+
+    @staticmethod
+    def _primary_exec_diagnostic(trace: _AttemptTrace) -> str:
+        for diagnostic in trace.diagnostics:
+            if diagnostic.startswith(("error:", "turn.failed:", "thread.failed:")):
+                return diagnostic
+        if trace.diagnostics:
+            return trace.diagnostics[-1]
+        return "no diagnostic text"
+
+    @staticmethod
+    def _is_retryable_exec_failure(error: LLMCallError) -> bool:
+        if error.error_type != "CodexExecError":
+            return False
+        diagnostic = json.dumps(
+            {
+                "message": error.message,
+                "details": error.details,
+            },
+            ensure_ascii=True,
+            sort_keys=True,
+        ).lower()
+        if any(token in diagnostic for token in _NON_RETRYABLE_EXEC_DIAGNOSTICS):
+            return False
+        return any(token in diagnostic for token in _RETRYABLE_EXEC_DIAGNOSTICS)
 
     @staticmethod
     def _aggregate_trace(
@@ -966,7 +1299,31 @@ class CodexExecClient:
 
     @asynccontextmanager
     async def _private_home(self) -> AsyncIterator[Path]:
-        codex_home = Path(tempfile.mkdtemp(prefix="simpletes-codex-"))
+        runtime_root: Path | None = self.runtime_home_root
+        if runtime_root is not None:
+            try:
+                runtime_root.mkdir(mode=0o700, parents=True, exist_ok=True)
+                mode = runtime_root.lstat().st_mode
+                if stat.S_ISLNK(mode) or not stat.S_ISDIR(mode):
+                    raise OSError("Codex runtime root is not a directory")
+                runtime_root.chmod(0o700)
+            except OSError as exc:
+                raise self._error(
+                    "CodexRuntimeError",
+                    "Codex could not create its private runtime home root",
+                ) from exc
+        try:
+            codex_home = Path(
+                tempfile.mkdtemp(
+                    prefix="simpletes-codex-",
+                    dir=str(runtime_root) if runtime_root is not None else None,
+                )
+            )
+        except OSError as exc:
+            raise self._error(
+                "CodexRuntimeError",
+                "Codex could not create an isolated runtime home",
+            ) from exc
         codex_home.chmod(0o700)
         try:
             yield codex_home
@@ -1055,8 +1412,59 @@ class CodexExecClient:
                 "Codex CLI produced no readable final response",
             ) from exc
 
+    async def _artifacted_subprocess_error(
+        self,
+        error: LLMCallError,
+        *,
+        request_dir: Path | None,
+        request_id: str,
+        instance_id: str,
+        structured_attempt: int,
+        exec_attempt: int,
+        stdout_path: Path,
+        stderr_path: Path,
+        output_path: Path,
+        temporary_secrets: frozenset[str],
+        prompt_sha256: str,
+        exit_status: int | None,
+    ) -> LLMCallError:
+        try:
+            _, artifact_path = await asyncio.to_thread(
+                self._persist_exec_failure,
+                request_dir=request_dir,
+                request_id=request_id,
+                instance_id=instance_id,
+                structured_attempt=structured_attempt,
+                exec_attempt=exec_attempt,
+                stdout_path=stdout_path,
+                stderr_path=stderr_path,
+                output_path=output_path,
+                temporary_secrets=temporary_secrets,
+                error=error,
+                prompt_sha256=prompt_sha256,
+                exit_status=exit_status,
+            )
+        except LLMCallError as audit_error:
+            return audit_error
+        if artifact_path is None:
+            return error
+        return self._error(
+            error.error_type,
+            error.message,
+            details=error.details,
+            artifact_paths=error.artifact_paths + (artifact_path,),
+        )
+
     async def _invoke_once(
-        self, prompt: str
+        self,
+        prompt: str,
+        *,
+        request_dir: Path | None,
+        request_id: str,
+        instance_id: str,
+        structured_attempt: int,
+        exec_attempt: int,
+        prompt_sha256: str,
     ) -> tuple[str, _AttemptTrace, frozenset[str]]:
         """Run one isolated Codex attempt and return its final response and trace."""
         if shutil.which(self.codex_binary) is None:
@@ -1206,11 +1614,32 @@ class CodexExecClient:
                         ensure_ascii=True,
                         sort_keys=True,
                     )
-                    raise self._error(
+                    timeout_error = self._error(
                         "TimeoutError",
                         "Codex CLI request timed out; "
                         f"sanitized_trace={trace_json}",
-                    ) from exc
+                        details={
+                            "attempt_trace": timeout_trace.to_dict(),
+                            "timeout_seconds": self.timeout,
+                        },
+                    )
+                    artifacted_error = await self._artifacted_subprocess_error(
+                        timeout_error,
+                        request_dir=request_dir,
+                        request_id=request_id,
+                        instance_id=instance_id,
+                        structured_attempt=structured_attempt,
+                        exec_attempt=exec_attempt,
+                        stdout_path=stdout_path,
+                        stderr_path=stderr_path,
+                        output_path=output_path,
+                        temporary_secrets=provider.temporary_secrets,
+                        prompt_sha256=prompt_sha256,
+                        exit_status=(
+                            process.returncode if process is not None else None
+                        ),
+                    )
+                    raise artifacted_error from exc
                 except OSError as exc:
                     if process is not None and process.returncode is None:
                         await self._kill_process(process)
@@ -1220,14 +1649,47 @@ class CodexExecClient:
 
             assert process is not None
             if process.returncode != 0:
-                diagnostic = self._diagnostic_from_file(
+                attempt_trace = self._summarize_event_stream(
+                    stdout_path,
                     stderr_path,
                     temporary_secrets=provider.temporary_secrets,
                 )
-                raise self._error(
-                    "CodexExecError",
-                    f"Codex CLI exited with status {process.returncode}: {diagnostic}",
+                diagnostic = self._primary_exec_diagnostic(attempt_trace)
+                trace_json = json.dumps(
+                    self._aggregate_trace([attempt_trace], []).to_dict(),
+                    ensure_ascii=True,
+                    sort_keys=True,
                 )
+                exec_error = self._error(
+                    "CodexExecError",
+                    f"Codex CLI exited with status {process.returncode}: "
+                    f"{diagnostic}; sanitized_trace={trace_json}",
+                    details={
+                        "exit_status": process.returncode,
+                        "attempt_trace": attempt_trace.to_dict(),
+                    },
+                )
+                retryable = self._is_retryable_exec_failure(exec_error)
+                exec_error = self._error(
+                    exec_error.error_type,
+                    exec_error.message,
+                    details={**exec_error.details, "retryable": retryable},
+                )
+                artifacted_error = await self._artifacted_subprocess_error(
+                    exec_error,
+                    request_dir=request_dir,
+                    request_id=request_id,
+                    instance_id=instance_id,
+                    structured_attempt=structured_attempt,
+                    exec_attempt=exec_attempt,
+                    stdout_path=stdout_path,
+                    stderr_path=stderr_path,
+                    output_path=output_path,
+                    temporary_secrets=provider.temporary_secrets,
+                    prompt_sha256=prompt_sha256,
+                    exit_status=process.returncode,
+                )
+                raise artifacted_error
             response_text = self._read_final_output(output_path)
             attempt_trace = self._summarize_event_stream(
                 stdout_path,
@@ -1251,10 +1713,89 @@ class CodexExecClient:
         prompt_sha256 = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
         current_prompt = prompt
         for attempt_index in range(self.max_repair_attempts + 1):
-            response_text, attempt_trace, temporary_secrets = await self._invoke_once(
-                current_prompt
-            )
-            attempts.append(attempt_trace)
+            response_text: str
+            attempt_trace: _AttemptTrace
+            temporary_secrets: frozenset[str]
+            invocation_prompt_sha256 = hashlib.sha256(
+                current_prompt.encode("utf-8")
+            ).hexdigest()
+            for exec_index in range(self.max_exec_retries + 1):
+                try:
+                    (
+                        response_text,
+                        attempt_trace,
+                        temporary_secrets,
+                    ) = await self._invoke_once(
+                        current_prompt,
+                        request_dir=request_dir,
+                        request_id=request_id,
+                        instance_id=instance_id,
+                        structured_attempt=attempt_index + 1,
+                        exec_attempt=exec_index + 1,
+                        prompt_sha256=invocation_prompt_sha256,
+                    )
+                except LLMCallError as error:
+                    error_trace = _AttemptTrace.from_dict(
+                        error.details.get("attempt_trace")
+                    )
+                    if error_trace is not None:
+                        attempts.append(error_trace)
+                    for artifact_path in error.artifact_paths:
+                        if artifact_path not in artifact_paths:
+                            artifact_paths.append(artifact_path)
+                    if self.attempt_artifact_root is not None:
+                        possible_request_dir = (
+                            self.attempt_artifact_root / f"request-{request_id}"
+                        )
+                        if (
+                            possible_request_dir.is_dir()
+                            and not possible_request_dir.is_symlink()
+                        ):
+                            request_dir = possible_request_dir
+                    if error.error_type != "CodexExecError":
+                        if artifact_paths != list(error.artifact_paths):
+                            raise self._error(
+                                error.error_type,
+                                error.message,
+                                details=error.details,
+                                artifact_paths=tuple(artifact_paths),
+                            ) from error
+                        raise
+                    safe_message = self._safe_diagnostic(
+                        error.message.encode("utf-8")
+                    )
+                    failures.append(
+                        f"attempt {attempt_index + 1}.exec {exec_index + 1}: "
+                        f"{error.error_type}: {safe_message}"[-1200:]
+                    )
+                    retryable = error.details.get("retryable") is True
+                    if retryable and exec_index < self.max_exec_retries:
+                        await asyncio.sleep(_EXEC_RETRY_DELAYS[exec_index])
+                        continue
+                    trace = self._aggregate_trace(attempts, failures)
+                    trace_json = json.dumps(
+                        trace.to_dict(), ensure_ascii=True, sort_keys=True
+                    )
+                    disposition = (
+                        "exhausted bounded transient retries"
+                        if retryable
+                        else "was classified as non-retryable"
+                    )
+                    raise self._error(
+                        error.error_type,
+                        f"{self._safe_diagnostic(error.message.encode('utf-8'))}; "
+                        f"Codex exec {disposition} after {exec_index + 1} "
+                        f"subprocess attempt(s); sanitized_trace={trace_json}",
+                        details={
+                            **error.details,
+                            "exec_attempts": exec_index + 1,
+                            "max_exec_retries": self.max_exec_retries,
+                        },
+                        artifact_paths=tuple(artifact_paths),
+                    ) from error
+                else:
+                    attempts.append(attempt_trace)
+                    break
             try:
                 value, canonical = self._parse_response(
                     response_text, temporary_secrets=temporary_secrets

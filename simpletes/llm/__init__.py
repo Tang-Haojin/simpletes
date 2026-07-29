@@ -78,6 +78,7 @@ def create_llm_client(
             attempt_artifact_dir=codex_attempt_artifact_dir,
             timeout=config.timeout,
             pool_size=config.gen_concurrency,
+            max_exec_retries=config.retry,
         )
     if config.llm_backend == "vllm_token_forcing":
         return VLLMTokenForcingClient(

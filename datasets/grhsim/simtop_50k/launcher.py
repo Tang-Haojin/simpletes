@@ -39,7 +39,17 @@ NUM_CHAINS = 4
 DEFAULT_GEN_CONCURRENCY = NUM_CHAINS
 DEFAULT_LLM_TIMEOUT = 10_800.0
 DEFAULT_CODEX_MAX_AGENT_THREADS = 3
+DEFAULT_CODEX_EXEC_RETRIES = 2
 DEFAULT_PREFLIGHT_TIMEOUT = 600.0
+PREFLIGHT_ATTEMPT_ARTIFACT_ROOT = (
+    SIMPLETES_ROOT
+    / "checkpoints"
+    / "grhsim_simtop_50k"
+    / ".preflight_llm_attempts"
+)
+PREFLIGHT_RUNTIME_HOME_ROOT = (
+    SIMPLETES_ROOT / "checkpoints" / "grhsim_simtop_50k" / ".codex_runtime"
+)
 PREFLIGHT_PROBE_PATH = "wolvrix/lib/emit/grhsim_cpp.cpp"
 PREFLIGHT_PROBE_SUBMODULE_PATH = "lib/emit/grhsim_cpp.cpp"
 PREFLIGHT_EVIDENCE_PREFIX = "repo_probe_attestation="
@@ -79,6 +89,15 @@ def _selected_reasoning_effort(args: argparse.Namespace) -> str:
     if not isinstance(effort, str) or not effort.strip():
         raise SystemExit("--reasoning-effort must be a non-empty string")
     return effort.strip()
+
+
+def _selected_codex_exec_retries(args: argparse.Namespace) -> int:
+    retries = getattr(
+        args, "codex_exec_retries", DEFAULT_CODEX_EXEC_RETRIES
+    )
+    if type(retries) is not int or not 0 <= retries <= 3:
+        raise SystemExit("--codex-exec-retries must be in 0..3")
+    return retries
 
 
 @dataclass(frozen=True)
@@ -558,6 +577,7 @@ def run_codex_preflight(args: argparse.Namespace) -> int:
     """Run a bounded repository-grounded capability smoke without research."""
     model = _selected_model(args)
     reasoning_effort = _selected_reasoning_effort(args)
+    codex_exec_retries = _selected_codex_exec_retries(args)
     is_k3 = model == "k3"
     output_mode = "local-json" if is_k3 else "provider-structured"
     tool_choice_mode = "required-first" if is_k3 else "auto"
@@ -617,6 +637,9 @@ def run_codex_preflight(args: argparse.Namespace) -> int:
             model_catalog_path=(
                 str(k3_model_catalog) if k3_model_catalog is not None else None
             ),
+            attempt_artifact_dir=str(PREFLIGHT_ATTEMPT_ARTIFACT_ROOT),
+            runtime_home_dir=str(PREFLIGHT_RUNTIME_HOME_ROOT),
+            max_exec_retries=codex_exec_retries,
         )
     except ValueError as error:
         raise SystemExit(
@@ -670,6 +693,7 @@ def run_codex_preflight(args: argparse.Namespace) -> int:
 def build_command(args: argparse.Namespace) -> tuple[list[str], dict[str, str]]:
     model = _selected_model(args)
     reasoning_effort = _selected_reasoning_effort(args)
+    codex_exec_retries = _selected_codex_exec_retries(args)
     is_k3 = model == "k3"
     output_mode = "local-json" if is_k3 else "provider-structured"
     tool_choice_mode = "required-first" if is_k3 else "auto"
@@ -804,6 +828,8 @@ def build_command(args: argparse.Namespace) -> tuple[list[str], dict[str, str]]:
         str(args.eval_timeout),
         "--timeout",
         str(args.llm_timeout),
+        "--retry",
+        str(codex_exec_retries),
         "--max-tokens",
         str(args.max_tokens),
         "--disable-reflection",
@@ -937,6 +963,15 @@ def main() -> int:
             "Maximum concurrently open K3-spawned subagents; this is not "
             "passed to other models "
             f"(default: {DEFAULT_CODEX_MAX_AGENT_THREADS})"
+        ),
+    )
+    parser.add_argument(
+        "--codex-exec-retries",
+        type=int,
+        default=DEFAULT_CODEX_EXEC_RETRIES,
+        help=(
+            "Retries for diagnosed transient non-zero Codex exits "
+            f"(default: {DEFAULT_CODEX_EXEC_RETRIES})"
         ),
     )
     parser.add_argument(

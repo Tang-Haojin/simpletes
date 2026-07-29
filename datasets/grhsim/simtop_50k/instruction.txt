@@ -6,6 +6,14 @@ implementation, generated GrhSIM and GSIM C++, prior experiments in
 Use concrete evidence; do not repeat a direction that the records already close
 unless you identify materially new evidence or a different mechanism.
 
+Keep repository inspection bounded to the target checkout that is already the
+working directory. Prefer `rg`, `rg --files`, and exact paths named by the task
+or prior records. Never recursively scan `/nfs/home`, the workspace parent,
+`/tmp`, evaluator slots, or the SimpleTES checkpoint tree, and do not use an
+unbounded `find` outside this repository. If `find` is genuinely needed, bind
+it to an exact repository subdirectory and a small `-maxdepth`. Inspection is
+read-only: do not probe writability or create, touch, move, or delete files.
+
 The only optimization objective and final score is SimTop 50k `Host time spent`
 walltime. Cycles, instructions, generated-source size, ELF sections, BAE, DAG
 edges, PMU counters, and profiles are diagnostic evidence only. A change is

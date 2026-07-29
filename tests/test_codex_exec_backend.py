@@ -148,7 +148,7 @@ for event in settings.get("events", []):
 time.sleep(float(settings.get("sleep", 0)))
 sys.stderr.write(settings["stderr"])
 status = int(settings["status"])
-if status == 0:
+if status == 0 or settings.get("write_output_on_failure", False):
     output = pathlib.Path(args[args.index("-o") + 1])
     output.write_text(settings["raw"] if settings["raw"] is not None else json.dumps(settings["response"]))
 sys.exit(status)
@@ -179,6 +179,7 @@ def _set_fake(
     stderr: str = "",
     events: list[dict[str, object]] | None = None,
     sleep: float = 0,
+    write_output_on_failure: bool = False,
 ) -> None:
     paths["settings"].write_text(
         json.dumps(
@@ -189,6 +190,7 @@ def _set_fake(
                 "status": status,
                 "events": DEFAULT_EVENTS if events is None else events,
                 "sleep": sleep,
+                "write_output_on_failure": write_output_on_failure,
             }
         ),
         encoding="utf-8",
@@ -207,6 +209,10 @@ def _set_fake_sequence(
                 "stderr": attempt.get("stderr", ""),
                 "status": attempt.get("status", 0),
                 "events": attempt.get("events", DEFAULT_EVENTS),
+                "sleep": attempt.get("sleep", 0),
+                "write_output_on_failure": attempt.get(
+                    "write_output_on_failure", False
+                ),
             }
         )
     paths["settings"].write_text(
@@ -314,6 +320,25 @@ def test_first_attempt_success_does_not_create_repair_artifacts(
     )
 
     assert json.loads(result.raw_output or "")["patch"] == "diff\n"
+    assert not artifact_root.exists()
+
+
+def test_tracked_run_uses_stable_private_runtime_root(tmp_path: Path) -> None:
+    paths = _make_inputs(tmp_path)
+    _set_fake(paths, response={"schema_version": 1, "patch": "diff\n"})
+    artifact_root = tmp_path / "checkpoint" / "llm_attempts"
+
+    asyncio.run(
+        _client(paths, attempt_artifact_dir=str(artifact_root)).generate("prompt")
+    )
+    record = json.loads(paths["log"].read_text(encoding="utf-8"))
+    runtime_root = tmp_path / "checkpoint" / ".codex_runtime"
+    request_home = Path(record["home"])
+
+    assert request_home.parent == runtime_root
+    assert runtime_root.is_dir()
+    assert runtime_root.stat().st_mode & 0o777 == 0o700
+    assert not request_home.exists()
     assert not artifact_root.exists()
 
 
@@ -1125,6 +1150,149 @@ def test_generate_does_not_echo_failed_subprocess_stderr(
     assert "unit-test-secret" not in str(raised.value)
 
 
+def test_nonzero_exit_persists_complete_redacted_subprocess_evidence(
+    tmp_path: Path,
+) -> None:
+    paths = _make_inputs(tmp_path)
+    long_marker = "BEGIN-FULL-EVENT-" + ("z" * 4096) + "-END-FULL-EVENT"
+    _set_fake(
+        paths,
+        raw='{"partial":"unit-test-secret"}\n',
+        status=7,
+        stderr="stderr retained unit-test-secret\n",
+        events=[
+            *DEFAULT_EVENTS,
+            {
+                "type": "turn.failed",
+                "error": {
+                    "message": long_marker
+                    + "; unit-test-secret; connection reset by peer"
+                },
+            },
+        ],
+        write_output_on_failure=True,
+    )
+    artifact_root = tmp_path / "checkpoint" / "llm_attempts"
+
+    with pytest.raises(LLMCallError) as raised:
+        asyncio.run(
+            _client(
+                paths,
+                attempt_artifact_dir=str(artifact_root),
+                max_exec_retries=0,
+            ).generate("prompt", instance_id="instance/unsafe")
+        )
+
+    error = raised.value
+    assert error.error_type == "CodexExecError"
+    assert error.details["retryable"] is True
+    assert "turn.failed" in error.message
+    assert "connection reset by peer" in error.message
+    assert "unit-test-secret" not in str(error)
+    assert len(error.artifact_paths) == 1
+    metadata_path = artifact_root.parent / error.artifact_paths[0]
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    stored = metadata["stored_artifacts"]
+    events_path = metadata_path.parent / stored["events"]["stored_path"]
+    stderr_path = metadata_path.parent / stored["stderr"]["stored_path"]
+    output_path = metadata_path.parent / stored["final_output"]["stored_path"]
+    stored_events = events_path.read_text(encoding="utf-8")
+
+    assert metadata["artifact_kind"] == "codex_subprocess_failure"
+    assert metadata["instance_id"] == "instance_unsafe"
+    assert metadata["structured_attempt"] == 1
+    assert metadata["exec_attempt"] == 1
+    assert metadata["exit_status"] == 7
+    assert long_marker in stored_events
+    assert "connection reset by peer" in stored_events
+    assert "unit-test-secret" not in stored_events
+    assert "*" * len("unit-test-secret") in stored_events
+    assert "unit-test-secret" not in stderr_path.read_text(encoding="utf-8")
+    assert "unit-test-secret" not in output_path.read_text(encoding="utf-8")
+    assert stored["events"]["stored_complete"] is True
+    assert stored["events"]["raw_source_persisted"] is False
+    assert stored["events"]["redaction_count"] == 1
+    assert metadata_path.stat().st_mode & 0o777 == 0o600
+    assert events_path.stat().st_mode & 0o777 == 0o600
+    assert metadata_path.parent.stat().st_mode & 0o777 == 0o700
+
+
+def test_transient_nonzero_exit_is_retried_without_consuming_generation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    paths = _make_inputs(tmp_path)
+    _set_fake_sequence(
+        paths,
+        [
+            {
+                "status": 7,
+                "stderr": "PATH helper warning",
+                "events": [
+                    {
+                        "type": "turn.failed",
+                        "error": {
+                            "message": "failed to create unified exec process: "
+                            "No such file or directory (os error 2)"
+                        },
+                    }
+                ],
+            },
+            {"response": {"schema_version": 1, "patch": "recovered\n"}},
+        ],
+    )
+    artifact_root = tmp_path / "checkpoint" / "llm_attempts"
+    monkeypatch.setattr(
+        "simpletes.llm.codex_exec._EXEC_RETRY_DELAYS", (0.0, 0.0, 0.0)
+    )
+
+    result = asyncio.run(
+        _client(
+            paths,
+            attempt_artifact_dir=str(artifact_root),
+            max_exec_retries=1,
+        ).generate("prompt", track_io=True)
+    )
+    tracked = json.loads(result.raw_output or "")
+
+    assert paths["counter"].read_text(encoding="utf-8") == "2"
+    assert tracked["response"]["patch"] == "recovered\n"
+    assert tracked["simpletes_codex_audit"]["attempt_count"] == 2
+    assert len(tracked["simpletes_codex_audit"]["failure_summaries"]) == 1
+    assert "unified exec process" in tracked["simpletes_codex_audit"][
+        "failure_summaries"
+    ][0]
+    artifact_paths = tracked["simpletes_codex_rejected_response_artifacts"]
+    assert len(artifact_paths) == 1
+    metadata = json.loads(
+        (artifact_root.parent / artifact_paths[0]).read_text(encoding="utf-8")
+    )
+    assert metadata["exec_attempt"] == 1
+    assert metadata["stored_artifacts"]["events"]["stored_complete"] is True
+
+
+def test_authentication_failure_is_not_retried(tmp_path: Path) -> None:
+    paths = _make_inputs(tmp_path)
+    _set_fake(
+        paths,
+        response={},
+        status=7,
+        events=[
+            {
+                "type": "turn.failed",
+                "error": {"message": "status 401 Unauthorized: invalid API key"},
+            }
+        ],
+    )
+
+    with pytest.raises(LLMCallError) as raised:
+        asyncio.run(_client(paths, max_exec_retries=2).generate("prompt"))
+
+    assert raised.value.error_type == "CodexExecError"
+    assert raised.value.details["retryable"] is False
+    assert raised.value.details["exec_attempts"] == 1
+    assert paths["counter"].read_text(encoding="utf-8") == "1"
+
+
 def test_event_jsonl_is_read_from_a_bounded_prefix(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1273,6 +1441,14 @@ def test_codex_tool_choice_mode_must_be_known(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="tool_choice_mode must be one of"):
         _client(paths, tool_choice_mode="unknown-mode")
+
+
+@pytest.mark.parametrize("retry", [-1, 4, True])
+def test_codex_exec_retry_count_is_bounded(tmp_path: Path, retry: object) -> None:
+    paths = _make_inputs(tmp_path)
+
+    with pytest.raises(ValueError, match="max_exec_retries must be in 0..3"):
+        _client(paths, max_exec_retries=retry)
 
 
 def test_codex_attempt_artifact_root_rejects_symbolic_link(
@@ -1565,11 +1741,13 @@ def test_factory_passes_overlay_and_repairs_empty_provider_response(
         codex_output_mode="local-json",
         codex_tool_choice_mode="auto",
         codex_model_catalog_path=str(paths["model_catalog"]),
+        retry=2,
         timeout=10,
     )
 
     client = create_llm_client(config)
     assert isinstance(client, CodexExecClient)
+    assert client.max_exec_retries == 2
     client.codex_binary = str(paths["executable"])
     result = asyncio.run(client.generate("factory prompt", track_io=True))
     tracked = json.loads(result.raw_output or "")

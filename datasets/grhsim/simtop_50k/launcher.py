@@ -749,8 +749,13 @@ def build_command(args: argparse.Namespace) -> tuple[list[str], dict[str, str]]:
     )
     if extend_resume_budget and resume_state is None:
         raise SystemExit("--extend-resume-budget requires --resume")
+    # An already-extended checkpoint must be restartable at its exact persisted
+    # absolute limit without asking the engine to extend it a second time.  The
+    # engine still fail-closes any non-exact resume unless the explicit
+    # extension flag is present, so allowing the wider launcher range for every
+    # resume does not make implicit budget growth possible.
     proposal_limit = (
-        MAX_EXTENDED_PROPOSALS if extend_resume_budget else MAX_PROPOSALS
+        MAX_EXTENDED_PROPOSALS if resume_state is not None else MAX_PROPOSALS
     )
     if not 1 <= args.max_proposals <= proposal_limit:
         raise SystemExit(

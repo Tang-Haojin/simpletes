@@ -2109,6 +2109,14 @@ def test_launcher_accepts_long_bounded_continuation_and_rejects_oversize_budget(
     assert "--max-generations 192" in extended_rendered
     assert "--max-valid-evaluations 32" in extended_rendered
 
+    args.extend_resume_budget = False
+    exact_extended_command, _environment = launcher.build_command(args)
+    exact_extended_rendered = " ".join(exact_extended_command)
+    assert "--max-generations 192" in exact_extended_rendered
+    assert "--max-valid-evaluations 32" in exact_extended_rendered
+    assert "--extend-resume-budget" not in exact_extended_command
+    args.extend_resume_budget = True
+
     args.max_proposals = launcher.MAX_EXTENDED_PROPOSALS + 1
     with pytest.raises(SystemExit, match=r"--max-proposals must be in 1\.\.256"):
         launcher.build_command(args)

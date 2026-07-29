@@ -50,7 +50,7 @@ Find a step function `h: [0, 2] → [0, 1]` with `∑h = n/2` that minimises `Ψ
 
 - **Seed**: `h ≡ 0.5` plus zero-mean random noise in `[-0.4, 0.4]`.
 - **Evolved**: seven-stage pipeline — warm-start from Paley, stochastic donor-receiver swaps, Adam on a smooth-max surrogate, guided swaps at the worst shift, binary rounding, binary best-swap, simulated annealing.
-- **Result**: `Ψ(h) = 0.380868` (paper reporting precision).
+- **Result**: `Ψ(h) = 0.380868`.
 
 ---
 

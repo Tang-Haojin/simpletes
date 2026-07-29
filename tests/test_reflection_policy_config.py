@@ -9,6 +9,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from simpletes.engine.checkpoint import CheckpointManager
+from simpletes.engine.core import SimpleTESEngine
 from simpletes.config import EngineConfig
 from simpletes.node import Node, NodeDatabase, Status
 from simpletes.policies import PendingFinalize, create_selector
@@ -263,3 +264,121 @@ def test_checkpoint_load_accepts_legacy_config_without_codex_provenance(tmp_path
 
     assert restored["instance_id"] == "legacy"
     assert restored["completed_evaluations"] == 0
+    assert restored["checkpoint_config"] == {
+        "model": "k3",
+        "llm_backend": "codex_exec",
+    }
+    assert restored["budget_extensions"] == []
+
+
+def _exhausted_rpucg_policy():
+    policy = create_selector(
+        "rpucg",
+        num_chains=4,
+        max_generations=64,
+        k=1,
+        c=0.5,
+        gamma=0.8,
+    )
+    state = policy.state_dict()
+    state["chain_prompt_count"] = {"0": 16, "1": 16, "2": 7, "3": 16}
+    policy.load_state_dict(state)
+    return policy
+
+
+def test_trajectory_policy_monotonically_extends_restored_chain_budgets():
+    policy = _exhausted_rpucg_policy()
+
+    extension = policy.extend_generation_budget(192)
+
+    assert extension["previous_max_generations"] == 64
+    assert extension["new_max_generations"] == 192
+    assert policy.max_generations == 192
+    assert policy.chain_gen_budget == {0: 48, 1: 48, 2: 48, 3: 48}
+    assert policy.prompt_budget == {0: 48, 1: 48, 2: 48, 3: 48}
+    assert policy.chain_prompt_count == {0: 16, 1: 16, 2: 7, 3: 16}
+    assert policy._ready_chains == [0, 1, 2, 3]
+
+    with pytest.raises(ValueError, match="must be greater"):
+        policy.extend_generation_budget(192)
+
+
+def test_engine_resume_budget_extension_is_explicit_and_audited(tmp_path):
+    checkpoint_config = {
+        "max_generations": 64,
+        "max_valid_evaluations": 32,
+    }
+    policy = _exhausted_rpucg_policy()
+    config = EngineConfig(
+        init_program="init.py",
+        evaluator_path="eval.py",
+        instruction_path="prompt.txt",
+        selector="rpucg",
+        num_chains=4,
+        k_candidates=1,
+        max_generations=192,
+        max_valid_evaluations=32,
+        extend_resume_budget=True,
+    )
+    engine = SimpleNamespace(
+        config=config,
+        selector=policy,
+        generation_attempts=64,
+        valid_evaluations=15,
+        _budget_extensions=[],
+    )
+
+    record = SimpleTESEngine._apply_resume_budget_contract(
+        engine,
+        str(tmp_path / "db_state_143702"),
+        {"checkpoint_config": checkpoint_config},
+    )
+
+    assert record is not None
+    assert record["previous_max_generations"] == 64
+    assert record["new_max_generations"] == 192
+    assert record["generation_attempts_at_extension"] == 64
+    assert record["valid_evaluations_at_extension"] == 15
+    assert record["policy"]["new_prompt_budget"] == {
+        0: 48,
+        1: 48,
+        2: 48,
+        3: 48,
+    }
+    assert engine._budget_extensions == [record]
+
+
+def test_engine_resume_budget_change_fails_without_explicit_extension(tmp_path):
+    policy = _exhausted_rpucg_policy()
+    config = EngineConfig(
+        init_program="init.py",
+        evaluator_path="eval.py",
+        instruction_path="prompt.txt",
+        selector="rpucg",
+        num_chains=4,
+        k_candidates=1,
+        max_generations=192,
+        max_valid_evaluations=32,
+    )
+    engine = SimpleNamespace(
+        config=config,
+        selector=policy,
+        generation_attempts=64,
+        valid_evaluations=15,
+        _budget_extensions=[],
+    )
+
+    with pytest.raises(ValueError, match="--extend-resume-budget"):
+        SimpleTESEngine._apply_resume_budget_contract(
+            engine,
+            str(tmp_path / "db_state_143702"),
+            {
+                "checkpoint_config": {
+                    "max_generations": 64,
+                    "max_valid_evaluations": 32,
+                }
+            },
+        )
+
+    assert policy.max_generations == 64
+    assert policy.prompt_budget == {0: 16, 1: 16, 2: 16, 3: 16}

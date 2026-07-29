@@ -52,6 +52,14 @@ def build_parser(*, mode: str = "single") -> argparse.ArgumentParser:
         help="Stop after this many valid candidate evaluations (default: disabled)",
     )
     parser.add_argument(
+        "--extend-resume-budget",
+        action="store_true",
+        help=(
+            "Explicitly allow a resumed checkpoint's generation/valid limits "
+            "to increase while preserving its existing counters and policy state"
+        ),
+    )
+    parser.add_argument(
         "--early-stop-score",
         type=float,
         default=None,

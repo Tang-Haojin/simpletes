@@ -34,6 +34,7 @@ K3_INSTRUCTION_SUFFIX = TASK_ROOT / "instruction.k3.txt"
 MODEL = "k3"
 REASONING_EFFORT = "ultra"
 MAX_PROPOSALS = 64
+MAX_EXTENDED_PROPOSALS = 256
 NUM_CHAINS = 4
 DEFAULT_GEN_CONCURRENCY = NUM_CHAINS
 DEFAULT_LLM_TIMEOUT = 10_800.0
@@ -719,8 +720,18 @@ def build_command(args: argparse.Namespace) -> tuple[list[str], dict[str, str]]:
         resume_state = validated_resume.state_dir
         init_program = validated_resume.seed_path
 
-    if not 1 <= args.max_proposals <= MAX_PROPOSALS:
-        raise SystemExit(f"--max-proposals must be in 1..{MAX_PROPOSALS}")
+    extend_resume_budget = bool(
+        getattr(args, "extend_resume_budget", False)
+    )
+    if extend_resume_budget and resume_state is None:
+        raise SystemExit("--extend-resume-budget requires --resume")
+    proposal_limit = (
+        MAX_EXTENDED_PROPOSALS if extend_resume_budget else MAX_PROPOSALS
+    )
+    if not 1 <= args.max_proposals <= proposal_limit:
+        raise SystemExit(
+            f"--max-proposals must be in 1..{proposal_limit}"
+        )
     if not 1 <= args.valid_target <= args.max_proposals:
         raise SystemExit("--valid-target must be in 1..max-proposals")
     gen_concurrency = getattr(
@@ -823,6 +834,8 @@ def build_command(args: argparse.Namespace) -> tuple[list[str], dict[str, str]]:
         )
     if resume_state is not None:
         command.extend(["--resume", str(resume_state)])
+    if extend_resume_budget:
+        command.append("--extend-resume-budget")
     command = [
         "bash",
         "-c",
@@ -886,6 +899,14 @@ def main() -> int:
     parser.add_argument("--output-path", type=Path, default=None)
     parser.add_argument("--slot-root", type=Path, default=None)
     parser.add_argument("--resume", type=Path, default=None)
+    parser.add_argument(
+        "--extend-resume-budget",
+        action="store_true",
+        help=(
+            "Monotonically extend an exact resume checkpoint's absolute "
+            "proposal/valid limits while preserving its accumulated state"
+        ),
+    )
     parser.add_argument("--max-proposals", type=int, default=16)
     parser.add_argument("--valid-target", type=int, default=8)
     parser.add_argument("--eval-timeout", type=float, default=21_600.0)

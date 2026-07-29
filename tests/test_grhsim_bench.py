@@ -2087,6 +2087,29 @@ def test_launcher_accepts_long_bounded_continuation_and_rejects_oversize_budget(
     with pytest.raises(SystemExit, match=r"--max-proposals must be in 1\.\.64"):
         launcher.build_command(args)
 
+    state = tmp_path / "instance" / "db_state_143702"
+    _write_v2_checkpoint_seed(state / "best_program.txt")
+    args.resume = state
+    args.extend_resume_budget = True
+    args.max_proposals = 192
+    args.valid_target = 32
+
+    extended_command, _environment = launcher.build_command(args)
+    extended_rendered = " ".join(extended_command)
+    assert "--resume" in extended_command
+    assert "--extend-resume-budget" in extended_command
+    assert "--max-generations 192" in extended_rendered
+    assert "--max-valid-evaluations 32" in extended_rendered
+
+    args.max_proposals = launcher.MAX_EXTENDED_PROPOSALS + 1
+    with pytest.raises(SystemExit, match=r"--max-proposals must be in 1\.\.256"):
+        launcher.build_command(args)
+
+    args.resume = None
+    args.max_proposals = 192
+    with pytest.raises(SystemExit, match="requires --resume"):
+        launcher.build_command(args)
+
 
 def test_launcher_rejects_symlinked_explicit_initial_seed(tmp_path: Path):
     target = tmp_path / "target"

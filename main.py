@@ -54,6 +54,9 @@ def main():
     parser = build_parser(mode="single")
     args = parser.parse_args()
 
+    if args.extend_resume_budget and not args.resume:
+        parser.error("--extend-resume-budget requires --resume")
+
     # Handle --list-policies (early exit, no other args needed)
     _handle_list_policies(args)
 

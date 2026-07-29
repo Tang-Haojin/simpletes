@@ -119,6 +119,7 @@ class EngineConfig:
     # Budget / termination
     max_generations: int = 100
     max_valid_evaluations: int | None = None
+    extend_resume_budget: bool = False
     early_stop_score: float | None = None
     
     # Prompt shape
@@ -220,6 +221,7 @@ def build_config_from_args(args: Any) -> EngineConfig:
         eval_python=resolve_eval_python(evaluator_path=args.evaluator, eval_venv=args.eval_venv),
         max_generations=args.max_generations,
         max_valid_evaluations=args.max_valid_evaluations,
+        extend_resume_budget=args.extend_resume_budget,
         early_stop_score=args.early_stop_score,
         num_inspirations=args.num_inspirations,
         min_inspirations_cnt=args.min_inspirations_cnt,

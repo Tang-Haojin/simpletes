@@ -189,6 +189,7 @@ class SimpleTESEngine(SchedulerMixin):
         self.generation_cancellations: int = 0
         self.evaluation_failures: int = 0
         self._failure_records: list[dict[str, Any]] = []
+        self._budget_extensions: list[dict[str, Any]] = []
         self._gen_inflight: int = 0
         self._eval_inflight: int = 0
         self.best_score: float = -float("inf")
@@ -646,6 +647,7 @@ class SimpleTESEngine(SchedulerMixin):
         # Save gen_id counter for resume
         metadata["gen_id_counter"] = self.generator.get_gen_id_counter()
         metadata["valid_evaluations"] = self.valid_evaluations
+        metadata["budget_extensions"] = list(self._budget_extensions)
         # Save per-chain best scores
         metadata["chain_best_scores"] = {
             str(k): v for k, v in self._chain_best_scores.items()
@@ -1054,8 +1056,15 @@ class SimpleTESEngine(SchedulerMixin):
         self.generation_cancellations = restored.get("generation_cancellations", 0)
         self.evaluation_failures = restored.get("evaluation_failures", 0)
         self._failure_records = restored.get("failure_records", [])
+        restored_extensions = restored.get("budget_extensions", [])
+        if not isinstance(restored_extensions, list) or not all(
+            isinstance(item, dict) for item in restored_extensions
+        ):
+            raise ValueError("checkpoint budget_extensions must be a list of objects")
+        self._budget_extensions = [dict(item) for item in restored_extensions]
         self.best_score = restored["best_score"]
         self.best_node_id = restored["best_node_id"]
+        budget_extension = self._apply_resume_budget_contract(path, restored)
         self.checkpoint_dir = self.checkpoint_manager.checkpoint_dir
         self._shared_construction_dir = os.path.join(self.checkpoint_dir, "shared_constructions")
         os.makedirs(self._shared_construction_dir, exist_ok=True)
@@ -1118,6 +1127,16 @@ class SimpleTESEngine(SchedulerMixin):
             for i in range(num_chains)
         )
 
+        extension_line = ""
+        if budget_extension is not None:
+            extension_line = (
+                "\n[dim]Budget extension:[/dim] "
+                f"generations {budget_extension['previous_max_generations']}"
+                f"→{budget_extension['new_max_generations']} | "
+                f"valid {budget_extension['previous_max_valid_evaluations']}"
+                f"→{budget_extension['new_max_valid_evaluations']}"
+            )
+
         rich_print(Panel(
             f"[bold cyan]Checkpoint Loaded[/bold cyan]\n"
             f"[dim]Instance:[/dim] [cyan]{self.instance_id}[/cyan]\n"
@@ -1130,9 +1149,144 @@ class SimpleTESEngine(SchedulerMixin):
             f"[dim]Best:[/dim] [green]{self.best_score:.8f}[/green]\n"
             f"[dim]DB nodes:[/dim] {db_node_count} | "
             f"[dim]Chains:[/dim] {chains_with_nodes}/{num_chains} with nodes | "
-            f"[dim]Budget remaining:[/dim] {total_budget_remaining} prompts",
+            f"[dim]Budget remaining:[/dim] {total_budget_remaining} prompts"
+            f"{extension_line}",
             border_style="cyan", title="[bold]Resume[/bold]",
         ))
+
+    def _apply_resume_budget_contract(
+        self, path: str, restored: dict[str, Any]
+    ) -> dict[str, Any] | None:
+        """Validate resume limits and optionally extend restored chain budgets."""
+        checkpoint_config = restored.get("checkpoint_config", {})
+        if not isinstance(checkpoint_config, dict):
+            raise ValueError("checkpoint_config must be an object")
+
+        policy_max = getattr(self.selector, "max_generations", None)
+        saved_max = checkpoint_config.get("max_generations", policy_max)
+        if isinstance(saved_max, bool) or not isinstance(saved_max, int) or saved_max < 0:
+            raise ValueError("checkpoint max_generations must be a non-negative integer")
+        if policy_max is not None and int(policy_max) != saved_max:
+            raise ValueError(
+                "checkpoint config/policy max_generations mismatch: "
+                f"config={saved_max}, policy={policy_max}"
+            )
+
+        requested_max = self.config.max_generations
+        if requested_max < self.generation_attempts:
+            raise ValueError(
+                "requested max_generations is below the restored attempt count: "
+                f"{requested_max} < {self.generation_attempts}"
+            )
+
+        saved_valid_known = "max_valid_evaluations" in checkpoint_config
+        saved_valid = checkpoint_config.get("max_valid_evaluations")
+        if saved_valid_known and (
+            isinstance(saved_valid, bool)
+            or (saved_valid is not None and not isinstance(saved_valid, int))
+        ):
+            raise ValueError(
+                "checkpoint max_valid_evaluations must be an integer or null"
+            )
+        requested_valid = self.config.max_valid_evaluations
+        if requested_valid is not None and requested_valid < self.valid_evaluations:
+            raise ValueError(
+                "requested max_valid_evaluations is below the restored valid count: "
+                f"{requested_valid} < {self.valid_evaluations}"
+            )
+
+        if not self.config.extend_resume_budget:
+            mismatches = []
+            if requested_max != saved_max:
+                mismatches.append(
+                    f"max_generations {saved_max}→{requested_max}"
+                )
+            if saved_valid_known and requested_valid != saved_valid:
+                mismatches.append(
+                    f"max_valid_evaluations {saved_valid}→{requested_valid}"
+                )
+            if mismatches:
+                raise ValueError(
+                    "resume budgets differ from the checkpoint; pass "
+                    "--extend-resume-budget for a monotonic extension: "
+                    + ", ".join(mismatches)
+                )
+            return None
+
+        policy_num_chains = getattr(self.selector, "num_chains", self.config.num_chains)
+        policy_k = getattr(self.selector, "k", self.config.k_candidates)
+        if policy_num_chains != self.config.num_chains:
+            raise ValueError(
+                "resume budget extension cannot change num_chains: "
+                f"{policy_num_chains} != {self.config.num_chains}"
+            )
+        if policy_k != self.config.k_candidates:
+            raise ValueError(
+                "resume budget extension cannot change k_candidates: "
+                f"{policy_k} != {self.config.k_candidates}"
+            )
+        if requested_max < saved_max:
+            raise ValueError(
+                "resume budget extension cannot lower max_generations: "
+                f"{requested_max} < {saved_max}"
+            )
+        if saved_valid_known:
+            if saved_valid is None and requested_valid is not None:
+                raise ValueError(
+                    "resume budget extension cannot replace an unlimited valid "
+                    "target with a finite target"
+                )
+            if (
+                saved_valid is not None
+                and requested_valid is not None
+                and requested_valid < saved_valid
+            ):
+                raise ValueError(
+                    "resume budget extension cannot lower max_valid_evaluations: "
+                    f"{requested_valid} < {saved_valid}"
+                )
+
+        valid_expanded = saved_valid_known and (
+            (saved_valid is not None and requested_valid is None)
+            or (
+                saved_valid is not None
+                and requested_valid is not None
+                and requested_valid > saved_valid
+            )
+        )
+        generations_expanded = requested_max > saved_max
+        if not generations_expanded and not valid_expanded:
+            raise ValueError(
+                "--extend-resume-budget requested, but neither resume limit increased"
+            )
+        if requested_max <= self.generation_attempts:
+            raise ValueError(
+                "extended max_generations must exceed the restored attempt count: "
+                f"{requested_max} <= {self.generation_attempts}"
+            )
+        if requested_valid is not None and requested_valid <= self.valid_evaluations:
+            raise ValueError(
+                "extended max_valid_evaluations must exceed the restored valid count: "
+                f"{requested_valid} <= {self.valid_evaluations}"
+            )
+
+        policy_extension: dict[str, Any] = {}
+        if generations_expanded:
+            policy_extension = self.selector.extend_generation_budget(requested_max)
+
+        record = {
+            "extended_at_utc": datetime.now(timezone.utc).isoformat(),
+            "source_checkpoint": str(Path(path).resolve()),
+            "previous_max_generations": saved_max,
+            "new_max_generations": requested_max,
+            "previous_max_valid_evaluations": saved_valid,
+            "new_max_valid_evaluations": requested_valid,
+            "generation_attempts_at_extension": self.generation_attempts,
+            "valid_evaluations_at_extension": self.valid_evaluations,
+            "policy": policy_extension,
+        }
+        self._budget_extensions.append(record)
+        return record
 
     @staticmethod
     def _resolve_resume_checkpoint_dir(resume_path: str) -> str:

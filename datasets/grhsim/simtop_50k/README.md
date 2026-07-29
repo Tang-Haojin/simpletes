@@ -102,9 +102,29 @@ explicit `best_program.txt` seeding.
   --resume checkpoints/grhsim_simtop_50k/<post-rwa-run>/<date>/instance-<id>
 ```
 
-Once a post-RWA run has exhausted its proposal budget, start a new instance
-seeded by that same-pin instance's `best_program.txt` instead of trying to
-enlarge the checkpoint's chain budgets:
+An exhausted post-RWA checkpoint may be extended in place only with the
+explicit `--extend-resume-budget` opt-in. Both limits are absolute totals, not
+increments. The engine preserves the existing nodes, scores, attempt/valid
+counters, per-chain prompt counts, histories, and failure records; it
+monotonically recomputes each chain's ceiling and writes the old/new limits plus
+the extension point into subsequent checkpoint metadata. Shrinking either
+limit, changing the chain count or `k`, selecting a limit below an already-used
+counter, or passing the flag without `--resume` fails closed. For example, this
+extends a completed `64/32` run to at most `192` total proposals while retaining
+the same cumulative target of `32` valid candidates:
+
+```bash
+GRHSIM_INFRA_RETRIES=8 \
+./.venv/bin/python datasets/grhsim/simtop_50k/launcher.py \
+  --resume checkpoints/grhsim_simtop_50k/<post-rwa-run>/<date>/instance-<id>/db_state_<time> \
+  --extend-resume-budget \
+  --max-proposals 192 \
+  --valid-target 32
+```
+
+Use a fresh instance seeded by the same-pin `best_program.txt` instead when an
+independent continuation is desired rather than preserving the original search
+tree and counters:
 
 ```bash
 ./.venv/bin/python datasets/grhsim/simtop_50k/launcher.py \
@@ -121,9 +141,10 @@ Omit `--resume` for this continuation so the launcher creates a fresh checkpoint
 instance with a fresh bounded search budget. Build/perf/staging/checkpoint
 artifacts are deliberately untracked.
 
-The default budget remains `16` proposals / `8` valid candidates. Longer fresh
-continuations may explicitly request up to `64` proposals; keep the valid target
-at or below the proposal budget. For example, a doubled search uses:
+The default budget remains `16` proposals / `8` valid candidates. Fresh runs
+may explicitly request up to `64` proposals. An explicit in-place extension may
+raise the absolute proposal ceiling to `256`; keep the valid target at or below
+the proposal budget. For example, a doubled fresh search uses:
 
 ```bash
 GRHSIM_INFRA_RETRIES=4 \
@@ -137,8 +158,8 @@ GRHSIM_INFRA_RETRIES=4 \
 
 `GRHSIM_INFRA_RETRIES=4` keeps up to five quiet-CCD runtime attempts inside one
 already-built evaluator invocation. It does not relax any runtime gate. A fresh
-long continuation must still omit `--resume`, so the larger limits apply to a
-new instance rather than mutating an exhausted checkpoint.
+continuation omits `--resume`; an in-place continuation requires both an exact
+resume state and the explicit extension flag above.
 
 If all in-process runtime attempts fail only because no whole CCD stays quiet,
 reuse the already-gated artifacts with the runtime-only entry point:

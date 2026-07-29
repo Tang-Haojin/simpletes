@@ -166,6 +166,12 @@ class Selector:
         """Restore state from checkpoint."""
         pass
 
+    def extend_generation_budget(self, max_generations: int) -> dict[str, Any]:
+        """Increase a restored policy's absolute generation budget."""
+        raise ValueError(
+            f"policy '{self.name}' does not support resume budget extension"
+        )
+
     def reconcile_with_db(self, db: NodeDatabase | NodeDatabaseSnapshot) -> None:
         """Optional hook to reconcile internal state after DB load."""
         pass
@@ -820,3 +826,54 @@ class TrajectoryPolicyBase(Selector):
             ]
 
             self._load_state_extra(state)
+
+    def extend_generation_budget(self, max_generations: int) -> dict[str, Any]:
+        """Monotonically extend chain budgets without resetting search state."""
+        with self._lock:
+            requested = int(max_generations)
+            previous = int(self.max_generations)
+            if requested <= previous:
+                raise ValueError(
+                    "extended max_generations must be greater than the "
+                    f"checkpoint value ({requested} <= {previous})"
+                )
+            if self._batches:
+                raise ValueError(
+                    "cannot extend generation budget while policy batches are pending"
+                )
+
+            next_chain_budget = compute_chain_budgets(requested, self.num_chains)
+            next_prompt_budget = {
+                i: (budget + self.k - 1) // self.k if budget > 0 else 0
+                for i, budget in next_chain_budget.items()
+            }
+            for chain_idx in range(self.num_chains):
+                old_limit = self.prompt_budget.get(chain_idx, 0)
+                used = self.chain_prompt_count.get(chain_idx, 0)
+                new_limit = next_prompt_budget.get(chain_idx, 0)
+                if new_limit < old_limit or new_limit < used:
+                    raise ValueError(
+                        "generation budget extension would shrink chain "
+                        f"{chain_idx}: used={used}, old={old_limit}, new={new_limit}"
+                    )
+
+            previous_chain_budget = dict(self.chain_gen_budget)
+            previous_prompt_budget = dict(self.prompt_budget)
+            self.max_generations = requested
+            self.chain_gen_budget = next_chain_budget
+            self.prompt_budget = next_prompt_budget
+            self._ready_chains = [
+                i
+                for i in range(self.num_chains)
+                if self.chain_prompt_count.get(i, 0) < self.prompt_budget.get(i, 0)
+            ]
+
+            return {
+                "previous_max_generations": previous,
+                "new_max_generations": requested,
+                "previous_chain_gen_budget": previous_chain_budget,
+                "new_chain_gen_budget": dict(self.chain_gen_budget),
+                "previous_prompt_budget": previous_prompt_budget,
+                "new_prompt_budget": dict(self.prompt_budget),
+                "chain_prompt_count": dict(self.chain_prompt_count),
+            }

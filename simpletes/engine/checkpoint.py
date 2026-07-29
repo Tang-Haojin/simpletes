@@ -243,6 +243,7 @@ class CheckpointManager:
             "instruction_suffix_path": c.instruction_suffix_path,
             "max_generations": c.max_generations,
             "max_valid_evaluations": c.max_valid_evaluations,
+            "extend_resume_budget": c.extend_resume_budget,
             "num_inspirations": c.num_inspirations,
             "min_inspirations_cnt": c.min_inspirations_cnt,
             "max_inspirations_cnt": c.max_inspirations_cnt,
@@ -323,12 +324,14 @@ class CheckpointManager:
         with open(metadata_path, encoding="utf-8") as f:
             metadata = json.load(f)
         with open(config_path, encoding="utf-8") as f:
-            _ = json.load(f)
+            checkpoint_config = json.load(f)
         with open(policy_path, encoding="utf-8") as f:
             policy_state = json.load(f)
 
         if not isinstance(metadata, dict):
             raise ValueError("metadata.json must contain a JSON object")
+        if not isinstance(checkpoint_config, dict):
+            raise ValueError("config.json must contain a JSON object")
         if not isinstance(policy_state, dict):
             policy_state = {}
 
@@ -429,4 +432,6 @@ class CheckpointManager:
             "failure_records": failure_records,
             "shared_constructions": shared_state,
             "chain_best_scores": metadata.get("chain_best_scores", {}),
+            "checkpoint_config": checkpoint_config,
+            "budget_extensions": metadata.get("budget_extensions", []),
         }

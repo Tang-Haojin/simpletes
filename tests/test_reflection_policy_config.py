@@ -10,6 +10,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from simpletes.engine.checkpoint import CheckpointManager
 from simpletes.engine.core import SimpleTESEngine
+from simpletes.cli import build_parser
 from simpletes.config import EngineConfig
 from simpletes.node import Node, NodeDatabase, Status
 from simpletes.policies import PendingFinalize, create_selector
@@ -23,6 +24,15 @@ REFLECTION_POLICIES = [
     "llm_rpucg",
     "llm_elite",
 ]
+
+
+@pytest.mark.parametrize("effort", ["xhigh", "max"])
+def test_main_cli_accepts_extended_reasoning_efforts(effort):
+    args = build_parser(mode="single").parse_args(
+        ["--reasoning-effort", effort]
+    )
+
+    assert args.reasoning_effort == effort
 
 
 def _build_policy(name: str):

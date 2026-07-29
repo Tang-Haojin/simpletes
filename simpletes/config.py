@@ -145,7 +145,7 @@ class EngineConfig:
     retry: int = 0
     timeout: float | None = 3000
     max_total_tokens: int | None = None  # Total token budget (prompt + completion). If set, caps completion tokens.
-    reasoning_effort: str = "medium"  # Reasoning effort level for supported models (low, medium, high, ultra)
+    reasoning_effort: str = "medium"  # Reasoning effort level for supported models (low, medium, high, xhigh, max, ultra)
     llm_backend: str = "litellm"  # litellm | vllm_token_forcing | codex_exec
 
     # Codex CLI (codex_exec backend). These are file locations, never secrets.

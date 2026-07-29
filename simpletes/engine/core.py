@@ -353,6 +353,11 @@ class SimpleTESEngine(SchedulerMixin):
             f"[dim]Params:[/dim] temp={c.temperature:g} | max_tokens={c.max_tokens}" +
             (f" | max_total_tokens={c.max_total_tokens}" if c.max_total_tokens else "") +
             f" | retry={c.retry}" +
+            (
+                f" | capacity_continue={c.codex_capacity_continuations}"
+                if c.llm_backend == "codex_exec"
+                else ""
+            ) +
             (f" | timeout={c.timeout:g}s" if c.timeout else ""),
         ])
         if c.api_base:

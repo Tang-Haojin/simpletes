@@ -67,6 +67,16 @@ it to validate K3 routing, credentials, tool use, JSON output, and patch
 applicability without starting performance research. `--dry-run` remains
 completely offline and only prints the future research command.
 
+For an exact `Selected model is at capacity` failure, the Codex backend keeps
+that request's private local session and sends `continue` to the exact
+`thread.started.thread_id`. It never uses `--last`, so concurrent generation
+workers cannot select one another's conversations. These bounded in-session
+continuations have their own delay/budget and do not consume SimpleTES's normal
+LLM retry count. Only after the continuation budget is exhausted (or no safe
+thread ID was emitted) does the current `--codex-exec-retries` policy apply.
+The default is three continuations with 1/2/5-second delays; set
+`--codex-capacity-continuations 0` to disable them.
+
 Defaults:
 
 - target checkout: sibling `wolvrix-playground-gsim-calibrate-5`
@@ -79,6 +89,7 @@ Defaults:
 - config: `~/.codex/config.kimi.toml`
 - auth: `~/.codex/auth.kimi.json`
 - capability preflight timeout: `600 s` (independent of generation timeout)
+- Codex capacity continuations / normal exec retries: `3` / `2`
 - initial program: `datasets/grhsim/simtop_50k/init_program.txt`
 - evaluator slots: `/tmp/simpletes-grhsim-simtop-50k`
 - checkpoints: `SimpleTES/checkpoints/grhsim_simtop_50k/<timestamp>`

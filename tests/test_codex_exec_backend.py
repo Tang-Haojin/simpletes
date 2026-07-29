@@ -279,7 +279,8 @@ def test_generate_uses_isolated_home_and_structured_output(
 
     args = record["args"]
     assert args[:3] == ["-a", "never", "exec"]
-    assert "--ephemeral" in args
+    assert "--ephemeral" not in args
+    assert "resume" not in args
     assert args[args.index("--disable") + 1] == "plugins"
     disabled_features = {
         args[index + 1]
@@ -1202,6 +1203,9 @@ def test_nonzero_exit_persists_complete_redacted_subprocess_evidence(
     assert metadata["instance_id"] == "instance_unsafe"
     assert metadata["structured_attempt"] == 1
     assert metadata["exec_attempt"] == 1
+    assert metadata["capacity_continuation"] == 0
+    assert metadata["conversation_mode"] == "start"
+    assert metadata["resume_thread_id"] is None
     assert metadata["exit_status"] == 7
     assert long_marker in stored_events
     assert "connection reset by peer" in stored_events
@@ -1282,6 +1286,182 @@ def test_transient_nonzero_exit_is_retried_without_consuming_generation(
     )
     assert metadata["exec_attempt"] == 1
     assert metadata["stored_artifacts"]["events"]["stored_complete"] is True
+
+
+def test_capacity_continues_exact_session_without_consuming_exec_retry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paths = _make_inputs(tmp_path)
+    capacity = "Selected model is at capacity. Please try a different model."
+    _set_fake_sequence(
+        paths,
+        [
+            {
+                "status": 7,
+                "events": [
+                    {"type": "thread.started", "thread_id": "fake-thread"},
+                    {"type": "turn.failed", "error": {"message": capacity}},
+                ],
+            },
+            {"response": {"schema_version": 1, "patch": "continued\n"}},
+        ],
+    )
+    artifact_root = tmp_path / "checkpoint" / "llm_attempts"
+    monkeypatch.setattr(
+        "simpletes.llm.codex_exec._CAPACITY_CONTINUATION_DELAYS",
+        (0.0,) * 8,
+    )
+
+    result = asyncio.run(
+        _client(
+            paths,
+            attempt_artifact_dir=str(artifact_root),
+            max_exec_retries=0,
+            max_capacity_continuations=1,
+        ).generate("original prompt", track_io=True)
+    )
+    tracked = json.loads(result.raw_output or "")
+    initial = json.loads(
+        (tmp_path / "invocation-0.json").read_text(encoding="utf-8")
+    )
+    resumed = json.loads(
+        (tmp_path / "invocation-1.json").read_text(encoding="utf-8")
+    )
+
+    assert paths["counter"].read_text(encoding="utf-8") == "2"
+    assert tracked["response"]["patch"] == "continued\n"
+    assert tracked["simpletes_codex_audit"]["attempt_count"] == 2
+    assert initial["prompt"] == "original prompt"
+    assert resumed["prompt"] == "continue"
+    assert initial["home"] == resumed["home"]
+    assert not Path(initial["home"]).exists()
+    assert initial["args"][:3] == ["-a", "never", "exec"]
+    assert initial["args"][3] != "resume"
+    assert resumed["args"][:4] == ["-a", "never", "exec", "resume"]
+    assert resumed["args"][-2:] == ["fake-thread", "-"]
+    assert "-C" not in resumed["args"]
+    assert "--sandbox" not in resumed["args"]
+
+    artifact_paths = tracked["simpletes_codex_rejected_response_artifacts"]
+    assert len(artifact_paths) == 1
+    metadata = json.loads(
+        (artifact_root.parent / artifact_paths[0]).read_text(encoding="utf-8")
+    )
+    assert metadata["exec_attempt"] == 1
+    assert metadata["capacity_continuation"] == 0
+    assert metadata["conversation_mode"] == "start"
+
+
+def test_capacity_continuation_exhaustion_then_uses_exec_retry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paths = _make_inputs(tmp_path)
+    capacity = "Selected model is at capacity. Please try a different model."
+    failed_events = [
+        {"type": "thread.started", "thread_id": "fake-thread"},
+        {"type": "turn.failed", "error": {"message": capacity}},
+    ]
+    _set_fake_sequence(
+        paths,
+        [
+            {"status": 7, "events": failed_events},
+            {"status": 7, "events": failed_events},
+            {"response": {"schema_version": 1, "patch": "fresh retry\n"}},
+        ],
+    )
+    artifact_root = tmp_path / "checkpoint" / "llm_attempts"
+    monkeypatch.setattr(
+        "simpletes.llm.codex_exec._CAPACITY_CONTINUATION_DELAYS",
+        (0.0,) * 8,
+    )
+    monkeypatch.setattr(
+        "simpletes.llm.codex_exec._EXEC_RETRY_DELAYS", (0.0, 0.0, 0.0)
+    )
+
+    result = asyncio.run(
+        _client(
+            paths,
+            attempt_artifact_dir=str(artifact_root),
+            max_exec_retries=1,
+            max_capacity_continuations=1,
+        ).generate("original prompt", track_io=True)
+    )
+    tracked = json.loads(result.raw_output or "")
+    invocations = [
+        json.loads(
+            (tmp_path / f"invocation-{index}.json").read_text(encoding="utf-8")
+        )
+        for index in range(3)
+    ]
+
+    assert tracked["response"]["patch"] == "fresh retry\n"
+    assert [item["prompt"] for item in invocations] == [
+        "original prompt",
+        "continue",
+        "original prompt",
+    ]
+    assert invocations[1]["args"][3] == "resume"
+    assert invocations[2]["args"][3] != "resume"
+    assert len({item["home"] for item in invocations}) == 1
+
+    metadata = [
+        json.loads(
+            (artifact_root.parent / path).read_text(encoding="utf-8")
+        )
+        for path in tracked["simpletes_codex_rejected_response_artifacts"]
+    ]
+    assert len(metadata) == 2
+    assert [item["exec_attempt"] for item in metadata] == [1, 1]
+    assert [item["capacity_continuation"] for item in metadata] == [0, 1]
+    assert [item["conversation_mode"] for item in metadata] == [
+        "start",
+        "resume",
+    ]
+    assert metadata[1]["resume_thread_id"] == "fake-thread"
+
+
+def test_nonretryable_capacity_diagnostic_does_not_resume_session(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paths = _make_inputs(tmp_path)
+    _set_fake(
+        paths,
+        status=7,
+        events=[
+            {"type": "thread.started", "thread_id": "fake-thread"},
+            {
+                "type": "turn.failed",
+                "error": {
+                    "message": (
+                        "status 400: Selected model is at capacity due to an "
+                        "invalid request"
+                    )
+                },
+            },
+        ],
+    )
+    monkeypatch.setattr(
+        "simpletes.llm.codex_exec._CAPACITY_CONTINUATION_DELAYS",
+        (0.0,) * 8,
+    )
+
+    with pytest.raises(LLMCallError) as raised:
+        asyncio.run(
+            _client(
+                paths,
+                max_exec_retries=1,
+                max_capacity_continuations=3,
+            ).generate("original prompt")
+        )
+
+    assert raised.value.error_type == "CodexExecError"
+    assert raised.value.details["retryable"] is False
+    assert raised.value.details["capacity_limited"] is True
+    assert raised.value.details["capacity_continuations"] == 0
+    assert paths["counter"].read_text(encoding="utf-8") == "1"
 
 
 def test_authentication_failure_is_not_retried(tmp_path: Path) -> None:
@@ -1463,6 +1643,18 @@ def test_codex_exec_retry_count_is_bounded(tmp_path: Path, retry: object) -> Non
 
     with pytest.raises(ValueError, match="max_exec_retries must be in 0..3"):
         _client(paths, max_exec_retries=retry)
+
+
+@pytest.mark.parametrize("continuations", [-1, 9, True])
+def test_codex_capacity_continuation_count_is_bounded(
+    tmp_path: Path, continuations: object
+) -> None:
+    paths = _make_inputs(tmp_path)
+
+    with pytest.raises(
+        ValueError, match="max_capacity_continuations must be in 0..8"
+    ):
+        _client(paths, max_capacity_continuations=continuations)
 
 
 def test_codex_attempt_artifact_root_rejects_symbolic_link(
@@ -1727,6 +1919,7 @@ def test_cli_builds_local_validation_overlay_config(tmp_path: Path) -> None:
     assert config.codex_tool_choice_mode == "required-first"
     assert config.codex_max_agent_threads == 2
     assert config.codex_model_catalog_path == str(paths["model_catalog"])
+    assert config.codex_capacity_continuations == 3
 
 
 def test_factory_passes_overlay_and_repairs_empty_provider_response(
@@ -1756,12 +1949,14 @@ def test_factory_passes_overlay_and_repairs_empty_provider_response(
         codex_tool_choice_mode="auto",
         codex_model_catalog_path=str(paths["model_catalog"]),
         retry=2,
+        codex_capacity_continuations=4,
         timeout=10,
     )
 
     client = create_llm_client(config)
     assert isinstance(client, CodexExecClient)
     assert client.max_exec_retries == 2
+    assert client.max_capacity_continuations == 4
     client.codex_binary = str(paths["executable"])
     result = asyncio.run(client.generate("factory prompt", track_io=True))
     tracked = json.loads(result.raw_output or "")

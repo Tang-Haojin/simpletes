@@ -202,6 +202,7 @@ def test_checkpoint_config_persists_k3_generation_provenance_without_auth(
         codex_tool_choice_mode="required-first",
         codex_max_agent_threads=3,
         codex_model_catalog_path="/work/k3_model_catalog.json",
+        codex_capacity_continuations=4,
         llm_policy_api_key="policy-key-must-not-persist",
     )
     manager = CheckpointManager(config, "instance-id", str(tmp_path))
@@ -237,6 +238,7 @@ def test_checkpoint_config_persists_k3_generation_provenance_without_auth(
     assert on_disk["codex_tool_choice_mode"] == "required-first"
     assert on_disk["codex_max_agent_threads"] == 3
     assert on_disk["codex_model_catalog_path"] == "/work/k3_model_catalog.json"
+    assert on_disk["codex_capacity_continuations"] == 4
 
     rendered = json.dumps(on_disk, sort_keys=True)
     assert "codex_auth_path" not in on_disk

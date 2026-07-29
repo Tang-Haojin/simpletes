@@ -446,6 +446,16 @@ def build_parser(*, mode: str = "single") -> argparse.ArgumentParser:
             "into each private Codex home"
         ),
     )
+    parser.add_argument(
+        "--codex-capacity-continuations",
+        type=int,
+        default=EngineConfig.codex_capacity_continuations,
+        help=(
+            "(codex_exec) In-session 'continue' turns attempted for model-at-"
+            "capacity before consuming a normal LLM retry "
+            f"(default: {EngineConfig.codex_capacity_continuations})"
+        ),
+    )
     # Resume
     parser.add_argument("--resume", type=str, help="Checkpoint path to resume from")
 

@@ -269,6 +269,7 @@ class CheckpointManager:
             "codex_tool_choice_mode": c.codex_tool_choice_mode,
             "codex_max_agent_threads": c.codex_max_agent_threads,
             "codex_model_catalog_path": c.codex_model_catalog_path,
+            "codex_capacity_continuations": c.codex_capacity_continuations,
             "context_window": c.context_window,
             "reasoning_budget": c.reasoning_budget,
             "response_budget": c.response_budget,

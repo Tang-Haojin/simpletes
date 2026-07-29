@@ -48,6 +48,7 @@ from simpletes.llm.types import LLMCallError, LLMResult
 _START_MARKER = "# EVOLVE-BLOCK-START"
 _END_MARKER = "# EVOLVE-BLOCK-END"
 _PROVIDER_NAME_PATTERN = re.compile(r"^[A-Za-z0-9_-]+$")
+_THREAD_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$")
 _SAFE_ENVIRONMENT_KEYS = frozenset(
     {
         "COLORTERM",
@@ -89,6 +90,9 @@ _MAX_FINAL_OUTPUT_BYTES = 4 * 1024 * 1024
 _MAX_CODEX_FAILURE_ARTIFACT_BYTES = 64 * 1024 * 1024
 _MAX_EXEC_RETRIES = 3
 _EXEC_RETRY_DELAYS = (5.0, 20.0, 60.0)
+_MAX_CAPACITY_CONTINUATIONS = 8
+_CAPACITY_CONTINUATION_DELAYS = (1.0, 2.0, 5.0, 10.0, 20.0, 30.0, 45.0, 60.0)
+_CAPACITY_CONTINUATION_PROMPT = "continue"
 _OUTPUT_MODES = frozenset({"provider-structured", "local-json"})
 _DEFAULT_OUTPUT_MODE = "provider-structured"
 _TOOL_CHOICE_MODES = frozenset({"auto", "required-first"})
@@ -139,6 +143,10 @@ _RETRYABLE_EXEC_DIAGNOSTICS = (
     "status 502",
     "status 503",
     "status 504",
+)
+_CAPACITY_EXEC_DIAGNOSTICS = (
+    "selected model is at capacity",
+    "model is at capacity",
 )
 
 
@@ -280,6 +288,7 @@ class CodexExecClient:
         attempt_artifact_dir: str | None = None,
         runtime_home_dir: str | None = None,
         max_exec_retries: int = 0,
+        max_capacity_continuations: int = 3,
     ) -> None:
         del pool_size  # The engine owns generation concurrency.
         self.model = model
@@ -357,6 +366,19 @@ class CodexExecClient:
                 f"Codex max_exec_retries must be in 0..{_MAX_EXEC_RETRIES}"
             )
         self.max_exec_retries = max_exec_retries
+        if (
+            type(max_capacity_continuations) is not int
+            or not (
+                0
+                <= max_capacity_continuations
+                <= _MAX_CAPACITY_CONTINUATIONS
+            )
+        ):
+            raise ValueError(
+                "Codex max_capacity_continuations must be in "
+                f"0..{_MAX_CAPACITY_CONTINUATIONS}"
+            )
+        self.max_capacity_continuations = max_capacity_continuations
         self._response_validator = response_validator
 
         self._validate_inputs()
@@ -939,6 +961,8 @@ class CodexExecClient:
         instance_id: str,
         structured_attempt: int,
         exec_attempt: int,
+        capacity_continuation: int,
+        resume_thread_id: str | None,
         stdout_path: Path,
         stderr_path: Path,
         output_path: Path,
@@ -952,9 +976,9 @@ class CodexExecClient:
             return request_dir, None
         if request_dir is None:
             request_dir = self._create_request_artifact_directory(request_id)
-        stem = (
-            f"attempt-{structured_attempt:02d}.exec-{exec_attempt:02d}"
-        )
+        stem = f"attempt-{structured_attempt:02d}.exec-{exec_attempt:02d}"
+        if capacity_continuation:
+            stem += f".continue-{capacity_continuation:02d}"
         source_specs = (
             ("events", stdout_path, request_dir / f"{stem}.events.jsonl"),
             ("stderr", stderr_path, request_dir / f"{stem}.stderr.log"),
@@ -1009,6 +1033,11 @@ class CodexExecClient:
                     "reasoning_effort": self.reasoning_effort,
                     "structured_attempt": structured_attempt,
                     "exec_attempt": exec_attempt,
+                    "capacity_continuation": capacity_continuation,
+                    "conversation_mode": (
+                        "resume" if resume_thread_id is not None else "start"
+                    ),
+                    "resume_thread_id": resume_thread_id,
                     "created_at": datetime.now(timezone.utc).isoformat(),
                     "error_type": error.error_type,
                     "error_message": self._safe_diagnostic(
@@ -1184,6 +1213,29 @@ class CodexExecClient:
             return trace.diagnostics[-1]
         return "no diagnostic text"
 
+    def _thread_id_from_event_stream(self, stdout_path: Path) -> str | None:
+        """Return the exact bounded thread id emitted by ``codex exec``."""
+        try:
+            raw, _ = self._read_bounded_file(
+                stdout_path, _MAX_CODEX_STDOUT_BYTES
+            )
+        except OSError:
+            return None
+        for raw_line in raw.splitlines():
+            try:
+                event = json.loads(raw_line)
+            except (UnicodeError, json.JSONDecodeError):
+                continue
+            if not isinstance(event, dict) or event.get("type") != "thread.started":
+                continue
+            thread_id = event.get("thread_id")
+            if (
+                isinstance(thread_id, str)
+                and _THREAD_ID_PATTERN.fullmatch(thread_id) is not None
+            ):
+                return thread_id
+        return None
+
     @staticmethod
     def _is_retryable_exec_failure(error: LLMCallError) -> bool:
         if error.error_type != "CodexExecError":
@@ -1199,6 +1251,20 @@ class CodexExecClient:
         if any(token in diagnostic for token in _NON_RETRYABLE_EXEC_DIAGNOSTICS):
             return False
         return any(token in diagnostic for token in _RETRYABLE_EXEC_DIAGNOSTICS)
+
+    @staticmethod
+    def _is_capacity_exec_failure(error: LLMCallError) -> bool:
+        if error.error_type != "CodexExecError":
+            return False
+        diagnostic = json.dumps(
+            {
+                "message": error.message,
+                "details": error.details,
+            },
+            ensure_ascii=True,
+            sort_keys=True,
+        ).lower()
+        return any(token in diagnostic for token in _CAPACITY_EXEC_DIAGNOSTICS)
 
     @staticmethod
     def _aggregate_trace(
@@ -1425,6 +1491,8 @@ class CodexExecClient:
         instance_id: str,
         structured_attempt: int,
         exec_attempt: int,
+        capacity_continuation: int,
+        resume_thread_id: str | None,
         stdout_path: Path,
         stderr_path: Path,
         output_path: Path,
@@ -1440,6 +1508,8 @@ class CodexExecClient:
                 instance_id=instance_id,
                 structured_attempt=structured_attempt,
                 exec_attempt=exec_attempt,
+                capacity_continuation=capacity_continuation,
+                resume_thread_id=resume_thread_id,
                 stdout_path=stdout_path,
                 stderr_path=stderr_path,
                 output_path=output_path,
@@ -1463,31 +1533,33 @@ class CodexExecClient:
         self,
         prompt: str,
         *,
+        codex_home: Path,
         request_dir: Path | None,
         request_id: str,
         instance_id: str,
         structured_attempt: int,
         exec_attempt: int,
+        capacity_continuation: int,
+        resume_thread_id: str | None,
         prompt_sha256: str,
     ) -> tuple[str, _AttemptTrace, frozenset[str]]:
-        """Run one isolated Codex attempt and return its final response and trace."""
+        """Run one Codex subprocess inside a request-private session home."""
         if shutil.which(self.codex_binary) is None:
             raise self._error("CodexNotFound", "Codex CLI executable was not found")
 
-        async with (
-            self._private_home() as codex_home,
-            self._provider_override() as provider,
-        ):
-            self._copy_private(self.config_path, codex_home / "config.toml")
-            private_model_catalog: Path | None = None
-            if self.model_catalog_path is not None:
-                private_model_catalog = codex_home / "model_catalog.json"
-                self._copy_private(
-                    self.model_catalog_path, private_model_catalog
-                )
-            output_path = codex_home / "last-message.json"
-            stdout_path = codex_home / "events.jsonl"
-            stderr_path = codex_home / "stderr.log"
+        async with self._provider_override() as provider:
+            private_model_catalog = (
+                codex_home / "model_catalog.json"
+                if self.model_catalog_path is not None
+                else None
+            )
+            file_stem = (
+                f"attempt-{structured_attempt:02d}.exec-{exec_attempt:02d}"
+                f".continue-{capacity_continuation:02d}"
+            )
+            output_path = codex_home / f"{file_stem}.last-message.json"
+            stdout_path = codex_home / f"{file_stem}.events.jsonl"
+            stderr_path = codex_home / f"{file_stem}.stderr.log"
 
             process_environment = self._safe_environment(codex_home)
             process_environment["OPENAI_API_KEY"] = provider.process_api_key
@@ -1499,10 +1571,10 @@ class CodexExecClient:
                 "-a",
                 "never",
                 "exec",
-                "--ephemeral",
-                "--disable",
-                "plugins",
             ]
+            if resume_thread_id is not None:
+                command.append("resume")
+            command.extend(["--disable", "plugins"])
             # The loopback compatibility proxy deliberately accepts plain JSON
             # only.  Preserve Codex's normal compression behavior for every
             # direct provider path and disable it only while that proxy is in
@@ -1511,36 +1583,41 @@ class CodexExecClient:
                 command.extend(["--disable", "enable_request_compression"])
             command.extend(
                 [
-                "--ignore-rules",
-                "--sandbox",
-                "read-only",
-                "-C",
-                str(self.repo_root),
-                "-m",
-                self.model,
-                "-c",
-                f'model_reasoning_effort="{self.reasoning_effort}"',
-                "-c",
-                f"{provider_prefix}.requires_openai_auth=false",
-                "-c",
-                f'{provider_prefix}.env_key="OPENAI_API_KEY"',
-                "-c",
-                "disable_response_storage=true",
-                "-c",
-                'network_access="disabled"',
-                "-c",
-                'shell_environment_policy.inherit="none"',
-                "-c",
-                f"shell_environment_policy.set.PATH={json.dumps(safe_path)}",
-                "-c",
-                f"shell_environment_policy.set.HOME={json.dumps(str(codex_home))}",
-                "-c",
-                "mcp_servers={}",
-                "-c",
-                "notify=[]",
-                "--json",
+                    "--ignore-rules",
+                    "-m",
+                    self.model,
+                    "-c",
+                    f'model_reasoning_effort="{self.reasoning_effort}"',
+                    "-c",
+                    f"{provider_prefix}.requires_openai_auth=false",
+                    "-c",
+                    f'{provider_prefix}.env_key="OPENAI_API_KEY"',
+                    "-c",
+                    "disable_response_storage=true",
+                    "-c",
+                    'network_access="disabled"',
+                    "-c",
+                    'shell_environment_policy.inherit="none"',
+                    "-c",
+                    f"shell_environment_policy.set.PATH={json.dumps(safe_path)}",
+                    "-c",
+                    f"shell_environment_policy.set.HOME={json.dumps(str(codex_home))}",
+                    "-c",
+                    "mcp_servers={}",
+                    "-c",
+                    "notify=[]",
+                    "--json",
                 ]
             )
+            if resume_thread_id is None:
+                command.extend(
+                    [
+                        "--sandbox",
+                        "read-only",
+                        "-C",
+                        str(self.repo_root),
+                    ]
+                )
             if self.max_agent_threads is not None:
                 command.extend(
                     [
@@ -1574,15 +1651,12 @@ class CodexExecClient:
                 command.extend(
                     ["--output-schema", str(self.output_schema_path)]
                 )
-            command.extend(
-                [
-                    "--color",
-                    "never",
-                    "-o",
-                    str(output_path),
-                    "-",
-                ]
-            )
+            if resume_thread_id is None:
+                command.extend(["--color", "never"])
+            command.extend(["-o", str(output_path)])
+            if resume_thread_id is not None:
+                command.append(resume_thread_id)
+            command.append("-")
             process: asyncio.subprocess.Process | None = None
             with stdout_path.open("wb") as stdout_stream, stderr_path.open(
                 "wb"
@@ -1634,6 +1708,8 @@ class CodexExecClient:
                         instance_id=instance_id,
                         structured_attempt=structured_attempt,
                         exec_attempt=exec_attempt,
+                        capacity_continuation=capacity_continuation,
+                        resume_thread_id=resume_thread_id,
                         stdout_path=stdout_path,
                         stderr_path=stderr_path,
                         output_path=output_path,
@@ -1671,13 +1747,21 @@ class CodexExecClient:
                     details={
                         "exit_status": process.returncode,
                         "attempt_trace": attempt_trace.to_dict(),
+                        "thread_id": self._thread_id_from_event_stream(
+                            stdout_path
+                        ),
                     },
                 )
                 retryable = self._is_retryable_exec_failure(exec_error)
+                capacity_limited = self._is_capacity_exec_failure(exec_error)
                 exec_error = self._error(
                     exec_error.error_type,
                     exec_error.message,
-                    details={**exec_error.details, "retryable": retryable},
+                    details={
+                        **exec_error.details,
+                        "retryable": retryable,
+                        "capacity_limited": capacity_limited,
+                    },
                 )
                 artifacted_error = await self._artifacted_subprocess_error(
                     exec_error,
@@ -1686,6 +1770,8 @@ class CodexExecClient:
                     instance_id=instance_id,
                     structured_attempt=structured_attempt,
                     exec_attempt=exec_attempt,
+                    capacity_continuation=capacity_continuation,
+                    resume_thread_id=resume_thread_id,
                     stdout_path=stdout_path,
                     stderr_path=stderr_path,
                     output_path=output_path,
@@ -1709,102 +1795,175 @@ class CodexExecClient:
         validate: ResponseValidator | None = None,
         instance_id: str = "",
     ) -> CodexProbeResult:
+        async with self._private_home() as codex_home:
+            self._copy_private(self.config_path, codex_home / "config.toml")
+            if self.model_catalog_path is not None:
+                self._copy_private(
+                    self.model_catalog_path, codex_home / "model_catalog.json"
+                )
+            return await self._invoke_in_home(
+                prompt,
+                codex_home=codex_home,
+                validate=validate,
+                instance_id=instance_id,
+            )
+
+    async def _invoke_in_home(
+        self,
+        prompt: str,
+        *,
+        codex_home: Path,
+        validate: ResponseValidator | None = None,
+        instance_id: str = "",
+    ) -> CodexProbeResult:
         failures: list[str] = []
         attempts: list[_AttemptTrace] = []
         artifact_paths: list[str] = []
         request_id = secrets.token_hex(16)
         request_dir: Path | None = None
         prompt_sha256 = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+        capacity_continuations_used = 0
         current_prompt = prompt
         for attempt_index in range(self.max_repair_attempts + 1):
             response_text: str
             attempt_trace: _AttemptTrace
             temporary_secrets: frozenset[str]
-            invocation_prompt_sha256 = hashlib.sha256(
-                current_prompt.encode("utf-8")
-            ).hexdigest()
+            conversation_traces: list[_AttemptTrace] = []
             for exec_index in range(self.max_exec_retries + 1):
-                try:
-                    (
-                        response_text,
-                        attempt_trace,
-                        temporary_secrets,
-                    ) = await self._invoke_once(
-                        current_prompt,
-                        request_dir=request_dir,
-                        request_id=request_id,
-                        instance_id=instance_id,
-                        structured_attempt=attempt_index + 1,
-                        exec_attempt=exec_index + 1,
-                        prompt_sha256=invocation_prompt_sha256,
+                conversation_traces = []
+                capacity_continuation = 0
+                resume_thread_id: str | None = None
+                terminal_error: LLMCallError | None = None
+                while True:
+                    invocation_prompt = (
+                        _CAPACITY_CONTINUATION_PROMPT
+                        if resume_thread_id is not None
+                        else current_prompt
                     )
-                except LLMCallError as error:
-                    error_trace = _AttemptTrace.from_dict(
-                        error.details.get("attempt_trace")
-                    )
-                    if error_trace is not None:
-                        attempts.append(error_trace)
-                    for artifact_path in error.artifact_paths:
-                        if artifact_path not in artifact_paths:
-                            artifact_paths.append(artifact_path)
-                    if self.attempt_artifact_root is not None:
-                        possible_request_dir = (
-                            self.attempt_artifact_root / f"request-{request_id}"
+                    try:
+                        (
+                            response_text,
+                            attempt_trace,
+                            temporary_secrets,
+                        ) = await self._invoke_once(
+                            invocation_prompt,
+                            codex_home=codex_home,
+                            request_dir=request_dir,
+                            request_id=request_id,
+                            instance_id=instance_id,
+                            structured_attempt=attempt_index + 1,
+                            exec_attempt=exec_index + 1,
+                            capacity_continuation=capacity_continuation,
+                            resume_thread_id=resume_thread_id,
+                            prompt_sha256=hashlib.sha256(
+                                invocation_prompt.encode("utf-8")
+                            ).hexdigest(),
                         )
-                        if (
-                            possible_request_dir.is_dir()
-                            and not possible_request_dir.is_symlink()
-                        ):
-                            request_dir = possible_request_dir
-                    if error.error_type != "CodexExecError":
-                        if artifact_paths != list(error.artifact_paths):
-                            raise self._error(
-                                error.error_type,
-                                error.message,
-                                details=error.details,
-                                artifact_paths=tuple(artifact_paths),
-                            ) from error
-                        raise
-                    safe_message = self._safe_diagnostic(
-                        error.message.encode("utf-8")
-                    )
-                    failures.append(
-                        f"attempt {attempt_index + 1}.exec {exec_index + 1}: "
-                        f"{error.error_type}: {safe_message}"[-1200:]
-                    )
-                    retryable = error.details.get("retryable") is True
-                    if retryable and exec_index < self.max_exec_retries:
-                        await asyncio.sleep(_EXEC_RETRY_DELAYS[exec_index])
-                        continue
-                    trace = self._aggregate_trace(attempts, failures)
-                    trace_json = json.dumps(
-                        trace.to_dict(), ensure_ascii=True, sort_keys=True
-                    )
-                    disposition = (
-                        "exhausted bounded transient retries"
-                        if retryable
-                        else "was classified as non-retryable"
-                    )
-                    raise self._error(
-                        error.error_type,
-                        f"{self._safe_diagnostic(error.message.encode('utf-8'))}; "
-                        f"Codex exec {disposition} after {exec_index + 1} "
-                        f"subprocess attempt(s); sanitized_trace={trace_json}",
-                        details={
-                            **error.details,
-                            "exec_attempts": exec_index + 1,
-                            "max_exec_retries": self.max_exec_retries,
-                        },
-                        artifact_paths=tuple(artifact_paths),
-                    ) from error
-                else:
-                    attempts.append(attempt_trace)
+                    except LLMCallError as error:
+                        error_trace = _AttemptTrace.from_dict(
+                            error.details.get("attempt_trace")
+                        )
+                        if error_trace is not None:
+                            attempts.append(error_trace)
+                            conversation_traces.append(error_trace)
+                        for artifact_path in error.artifact_paths:
+                            if artifact_path not in artifact_paths:
+                                artifact_paths.append(artifact_path)
+                        if self.attempt_artifact_root is not None:
+                            possible_request_dir = (
+                                self.attempt_artifact_root
+                                / f"request-{request_id}"
+                            )
+                            if (
+                                possible_request_dir.is_dir()
+                                and not possible_request_dir.is_symlink()
+                            ):
+                                request_dir = possible_request_dir
+                        if error.error_type != "CodexExecError":
+                            if artifact_paths != list(error.artifact_paths):
+                                raise self._error(
+                                    error.error_type,
+                                    error.message,
+                                    details=error.details,
+                                    artifact_paths=tuple(artifact_paths),
+                                ) from error
+                            raise
+                        safe_message = self._safe_diagnostic(
+                            error.message.encode("utf-8")
+                        )
+                        failures.append(
+                            f"attempt {attempt_index + 1}.exec "
+                            f"{exec_index + 1}.capacity_continue "
+                            f"{capacity_continuation}: {error.error_type}: "
+                            f"{safe_message}"[-1200:]
+                        )
+                        thread_id = error.details.get("thread_id")
+                        if not isinstance(thread_id, str) or not thread_id:
+                            thread_id = resume_thread_id
+                        can_continue_session = (
+                            error.details.get("retryable") is True
+                            and error.details.get("capacity_limited") is True
+                            and thread_id is not None
+                            and capacity_continuation
+                            < self.max_capacity_continuations
+                        )
+                        if can_continue_session:
+                            await asyncio.sleep(
+                                _CAPACITY_CONTINUATION_DELAYS[
+                                    capacity_continuation
+                                ]
+                            )
+                            capacity_continuation += 1
+                            capacity_continuations_used += 1
+                            resume_thread_id = thread_id
+                            continue
+                        terminal_error = error
+                        break
+                    else:
+                        attempts.append(attempt_trace)
+                        conversation_traces.append(attempt_trace)
+                        terminal_error = None
+                        break
+                if terminal_error is None:
                     break
+                retryable = terminal_error.details.get("retryable") is True
+                if retryable and exec_index < self.max_exec_retries:
+                    await asyncio.sleep(_EXEC_RETRY_DELAYS[exec_index])
+                    continue
+                trace = self._aggregate_trace(attempts, failures)
+                trace_json = json.dumps(
+                    trace.to_dict(), ensure_ascii=True, sort_keys=True
+                )
+                disposition = (
+                    "exhausted bounded transient retries"
+                    if retryable
+                    else "was classified as non-retryable"
+                )
+                raise self._error(
+                    terminal_error.error_type,
+                    f"{self._safe_diagnostic(terminal_error.message.encode('utf-8'))}; "
+                    f"Codex exec {disposition} after {exec_index + 1} "
+                    "SimpleTES exec attempt(s) plus "
+                    f"{capacity_continuations_used} in-session capacity "
+                    f"continuation(s); sanitized_trace={trace_json}",
+                    details={
+                        **terminal_error.details,
+                        "exec_attempts": exec_index + 1,
+                        "max_exec_retries": self.max_exec_retries,
+                        "capacity_continuations": capacity_continuations_used,
+                        "max_capacity_continuations": (
+                            self.max_capacity_continuations
+                        ),
+                    },
+                    artifact_paths=tuple(artifact_paths),
+                ) from terminal_error
             try:
                 value, canonical = self._parse_response(
                     response_text, temporary_secrets=temporary_secrets
                 )
-                current_trace = self._aggregate_trace([attempt_trace], failures)
+                current_trace = self._aggregate_trace(
+                    conversation_traces, failures
+                )
                 if (
                     self.tool_choice_mode == "required-first"
                     and current_trace.repo_tool_call_count < 1

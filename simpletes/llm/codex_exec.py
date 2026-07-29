@@ -88,7 +88,7 @@ _MAX_CODEX_STDERR_BYTES = 1024 * 1024
 _MAX_FINAL_OUTPUT_BYTES = 4 * 1024 * 1024
 _MAX_CODEX_FAILURE_ARTIFACT_BYTES = 64 * 1024 * 1024
 _MAX_EXEC_RETRIES = 3
-_EXEC_RETRY_DELAYS = (1.0, 4.0, 12.0)
+_EXEC_RETRY_DELAYS = (5.0, 20.0, 60.0)
 _OUTPUT_MODES = frozenset({"provider-structured", "local-json"})
 _DEFAULT_OUTPUT_MODE = "provider-structured"
 _TOOL_CHOICE_MODES = frozenset({"auto", "required-first"})
@@ -123,6 +123,10 @@ _RETRYABLE_EXEC_DIAGNOSTICS = (
     "broken pipe",
     "transport error",
     "websocket",
+    "at capacity",
+    "currently overloaded",
+    "model overloaded",
+    "try again later",
     "temporarily unavailable",
     "service unavailable",
     "internal server error",

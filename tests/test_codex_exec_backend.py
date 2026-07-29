@@ -1217,8 +1217,25 @@ def test_nonzero_exit_persists_complete_redacted_subprocess_evidence(
     assert metadata_path.parent.stat().st_mode & 0o777 == 0o700
 
 
+@pytest.mark.parametrize(
+    ("failure_message", "expected_summary"),
+    [
+        (
+            "failed to create unified exec process: "
+            "No such file or directory (os error 2)",
+            "unified exec process",
+        ),
+        (
+            "Selected model is at capacity. Please try a different model.",
+            "at capacity",
+        ),
+    ],
+)
 def test_transient_nonzero_exit_is_retried_without_consuming_generation(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_message: str,
+    expected_summary: str,
 ) -> None:
     paths = _make_inputs(tmp_path)
     _set_fake_sequence(
@@ -1230,10 +1247,7 @@ def test_transient_nonzero_exit_is_retried_without_consuming_generation(
                 "events": [
                     {
                         "type": "turn.failed",
-                        "error": {
-                            "message": "failed to create unified exec process: "
-                            "No such file or directory (os error 2)"
-                        },
+                        "error": {"message": failure_message},
                     }
                 ],
             },
@@ -1258,7 +1272,7 @@ def test_transient_nonzero_exit_is_retried_without_consuming_generation(
     assert tracked["response"]["patch"] == "recovered\n"
     assert tracked["simpletes_codex_audit"]["attempt_count"] == 2
     assert len(tracked["simpletes_codex_audit"]["failure_summaries"]) == 1
-    assert "unified exec process" in tracked["simpletes_codex_audit"][
+    assert expected_summary in tracked["simpletes_codex_audit"][
         "failure_summaries"
     ][0]
     artifact_paths = tracked["simpletes_codex_rejected_response_artifacts"]

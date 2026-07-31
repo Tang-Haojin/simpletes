@@ -355,6 +355,7 @@ class SimpleTESEngine(SchedulerMixin):
             f" | retry={c.retry}" +
             (
                 f" | capacity_continue={c.codex_capacity_continuations}"
+                f" | transient_continue={c.codex_transient_continuations}"
                 if c.llm_backend == "codex_exec"
                 else ""
             ) +

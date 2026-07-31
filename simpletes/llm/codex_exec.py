@@ -92,7 +92,18 @@ _MAX_EXEC_RETRIES = 3
 _EXEC_RETRY_DELAYS = (5.0, 20.0, 60.0)
 _MAX_CAPACITY_CONTINUATIONS = 8
 _CAPACITY_CONTINUATION_DELAYS = (1.0, 2.0, 5.0, 10.0, 20.0, 30.0, 45.0, 60.0)
-_CAPACITY_CONTINUATION_PROMPT = "continue"
+_MAX_TRANSIENT_CONTINUATIONS = 8
+_TRANSIENT_CONTINUATION_DELAYS = (
+    1.0,
+    2.0,
+    5.0,
+    10.0,
+    20.0,
+    30.0,
+    45.0,
+    60.0,
+)
+_SESSION_CONTINUATION_PROMPT = "continue"
 _OUTPUT_MODES = frozenset({"provider-structured", "local-json"})
 _DEFAULT_OUTPUT_MODE = "provider-structured"
 _TOOL_CHOICE_MODES = frozenset({"auto", "required-first"})
@@ -143,10 +154,24 @@ _RETRYABLE_EXEC_DIAGNOSTICS = (
     "status 502",
     "status 503",
     "status 504",
+    "error running remote compact task",
+    "remote compaction v2 expected exactly one compaction output item",
+    "reconnecting...",
+    "stream disconnected before completion",
+    "upstream request failed",
 )
 _CAPACITY_EXEC_DIAGNOSTICS = (
     "selected model is at capacity",
     "model is at capacity",
+)
+_REMOTE_COMPACT_EXEC_DIAGNOSTICS = (
+    "error running remote compact task",
+    "remote compaction v2 expected exactly one compaction output item",
+)
+_RECONNECT_EXEC_DIAGNOSTICS = (
+    "reconnecting...",
+    "stream disconnected before completion",
+    "upstream request failed",
 )
 
 
@@ -289,6 +314,7 @@ class CodexExecClient:
         runtime_home_dir: str | None = None,
         max_exec_retries: int = 0,
         max_capacity_continuations: int = 3,
+        max_transient_continuations: int = 3,
     ) -> None:
         del pool_size  # The engine owns generation concurrency.
         self.model = model
@@ -379,6 +405,19 @@ class CodexExecClient:
                 f"0..{_MAX_CAPACITY_CONTINUATIONS}"
             )
         self.max_capacity_continuations = max_capacity_continuations
+        if (
+            type(max_transient_continuations) is not int
+            or not (
+                0
+                <= max_transient_continuations
+                <= _MAX_TRANSIENT_CONTINUATIONS
+            )
+        ):
+            raise ValueError(
+                "Codex max_transient_continuations must be in "
+                f"0..{_MAX_TRANSIENT_CONTINUATIONS}"
+            )
+        self.max_transient_continuations = max_transient_continuations
         self._response_validator = response_validator
 
         self._validate_inputs()
@@ -962,6 +1001,7 @@ class CodexExecClient:
         structured_attempt: int,
         exec_attempt: int,
         capacity_continuation: int,
+        continuation_reason: str | None,
         resume_thread_id: str | None,
         stdout_path: Path,
         stderr_path: Path,
@@ -1033,7 +1073,12 @@ class CodexExecClient:
                     "reasoning_effort": self.reasoning_effort,
                     "structured_attempt": structured_attempt,
                     "exec_attempt": exec_attempt,
+                    # Kept for schema-v1 artifact compatibility.  It is the
+                    # total exact-session continuation index, including
+                    # capacity and transient-session continuations.
                     "capacity_continuation": capacity_continuation,
+                    "session_continuation": capacity_continuation,
+                    "continuation_reason": continuation_reason,
                     "conversation_mode": (
                         "resume" if resume_thread_id is not None else "start"
                     ),
@@ -1267,6 +1312,37 @@ class CodexExecClient:
         return any(token in diagnostic for token in _CAPACITY_EXEC_DIAGNOSTICS)
 
     @staticmethod
+    def _is_remote_compact_exec_failure(error: LLMCallError) -> bool:
+        if error.error_type != "CodexExecError":
+            return False
+        diagnostic = json.dumps(
+            {
+                "message": error.message,
+                "details": error.details,
+            },
+            ensure_ascii=True,
+            sort_keys=True,
+        ).lower()
+        return any(
+            token in diagnostic
+            for token in _REMOTE_COMPACT_EXEC_DIAGNOSTICS
+        )
+
+    @staticmethod
+    def _is_reconnect_exec_failure(error: LLMCallError) -> bool:
+        if error.error_type != "CodexExecError":
+            return False
+        diagnostic = json.dumps(
+            {
+                "message": error.message,
+                "details": error.details,
+            },
+            ensure_ascii=True,
+            sort_keys=True,
+        ).lower()
+        return any(token in diagnostic for token in _RECONNECT_EXEC_DIAGNOSTICS)
+
+    @staticmethod
     def _aggregate_trace(
         attempts: list[_AttemptTrace], failures: list[str]
     ) -> CodexTraceSummary:
@@ -1492,6 +1568,7 @@ class CodexExecClient:
         structured_attempt: int,
         exec_attempt: int,
         capacity_continuation: int,
+        continuation_reason: str | None,
         resume_thread_id: str | None,
         stdout_path: Path,
         stderr_path: Path,
@@ -1509,6 +1586,7 @@ class CodexExecClient:
                 structured_attempt=structured_attempt,
                 exec_attempt=exec_attempt,
                 capacity_continuation=capacity_continuation,
+                continuation_reason=continuation_reason,
                 resume_thread_id=resume_thread_id,
                 stdout_path=stdout_path,
                 stderr_path=stderr_path,
@@ -1540,6 +1618,7 @@ class CodexExecClient:
         structured_attempt: int,
         exec_attempt: int,
         capacity_continuation: int,
+        continuation_reason: str | None,
         resume_thread_id: str | None,
         prompt_sha256: str,
     ) -> tuple[str, _AttemptTrace, frozenset[str]]:
@@ -1670,6 +1749,7 @@ class CodexExecClient:
                         stdout=stdout_stream,
                         stderr=stderr_stream,
                         env=process_environment,
+                        cwd=self.repo_root,
                         start_new_session=True,
                     )
                     communicate = process.communicate(prompt.encode("utf-8"))
@@ -1709,6 +1789,7 @@ class CodexExecClient:
                         structured_attempt=structured_attempt,
                         exec_attempt=exec_attempt,
                         capacity_continuation=capacity_continuation,
+                        continuation_reason=continuation_reason,
                         resume_thread_id=resume_thread_id,
                         stdout_path=stdout_path,
                         stderr_path=stderr_path,
@@ -1754,6 +1835,10 @@ class CodexExecClient:
                 )
                 retryable = self._is_retryable_exec_failure(exec_error)
                 capacity_limited = self._is_capacity_exec_failure(exec_error)
+                remote_compact_failed = (
+                    self._is_remote_compact_exec_failure(exec_error)
+                )
+                reconnect_failed = self._is_reconnect_exec_failure(exec_error)
                 exec_error = self._error(
                     exec_error.error_type,
                     exec_error.message,
@@ -1761,6 +1846,11 @@ class CodexExecClient:
                         **exec_error.details,
                         "retryable": retryable,
                         "capacity_limited": capacity_limited,
+                        "remote_compact_failed": remote_compact_failed,
+                        "reconnect_failed": reconnect_failed,
+                        "transient_session_failure": (
+                            remote_compact_failed or reconnect_failed
+                        ),
                     },
                 )
                 artifacted_error = await self._artifacted_subprocess_error(
@@ -1771,6 +1861,7 @@ class CodexExecClient:
                     structured_attempt=structured_attempt,
                     exec_attempt=exec_attempt,
                     capacity_continuation=capacity_continuation,
+                    continuation_reason=continuation_reason,
                     resume_thread_id=resume_thread_id,
                     stdout_path=stdout_path,
                     stderr_path=stderr_path,
@@ -1823,6 +1914,7 @@ class CodexExecClient:
         request_dir: Path | None = None
         prompt_sha256 = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
         capacity_continuations_used = 0
+        transient_continuations_used = 0
         current_prompt = prompt
         for attempt_index in range(self.max_repair_attempts + 1):
             response_text: str
@@ -1831,12 +1923,15 @@ class CodexExecClient:
             conversation_traces: list[_AttemptTrace] = []
             for exec_index in range(self.max_exec_retries + 1):
                 conversation_traces = []
-                capacity_continuation = 0
+                session_continuation = 0
+                capacity_continuations_in_session = 0
+                transient_continuations_in_session = 0
+                continuation_reason: str | None = None
                 resume_thread_id: str | None = None
                 terminal_error: LLMCallError | None = None
                 while True:
                     invocation_prompt = (
-                        _CAPACITY_CONTINUATION_PROMPT
+                        _SESSION_CONTINUATION_PROMPT
                         if resume_thread_id is not None
                         else current_prompt
                     )
@@ -1853,7 +1948,8 @@ class CodexExecClient:
                             instance_id=instance_id,
                             structured_attempt=attempt_index + 1,
                             exec_attempt=exec_index + 1,
-                            capacity_continuation=capacity_continuation,
+                            capacity_continuation=session_continuation,
+                            continuation_reason=continuation_reason,
                             resume_thread_id=resume_thread_id,
                             prompt_sha256=hashlib.sha256(
                                 invocation_prompt.encode("utf-8")
@@ -1893,28 +1989,70 @@ class CodexExecClient:
                         )
                         failures.append(
                             f"attempt {attempt_index + 1}.exec "
-                            f"{exec_index + 1}.capacity_continue "
-                            f"{capacity_continuation}: {error.error_type}: "
+                            f"{exec_index + 1}.session_continue "
+                            f"{session_continuation}"
+                            f"[{continuation_reason or 'start'}]: "
+                            f"{error.error_type}: "
                             f"{safe_message}"[-1200:]
                         )
                         thread_id = error.details.get("thread_id")
                         if not isinstance(thread_id, str) or not thread_id:
                             thread_id = resume_thread_id
-                        can_continue_session = (
-                            error.details.get("retryable") is True
-                            and error.details.get("capacity_limited") is True
+                        retryable = error.details.get("retryable") is True
+                        capacity_limited = (
+                            error.details.get("capacity_limited") is True
+                        )
+                        transient_session_failure = (
+                            error.details.get("transient_session_failure")
+                            is True
+                        )
+                        can_continue_capacity = (
+                            retryable
+                            and capacity_limited
                             and thread_id is not None
-                            and capacity_continuation
+                            and capacity_continuations_in_session
                             < self.max_capacity_continuations
                         )
-                        if can_continue_session:
-                            await asyncio.sleep(
-                                _CAPACITY_CONTINUATION_DELAYS[
-                                    capacity_continuation
-                                ]
+                        can_continue_transient = (
+                            retryable
+                            and transient_session_failure
+                            and thread_id is not None
+                            and transient_continuations_in_session
+                            < self.max_transient_continuations
+                        )
+                        if can_continue_capacity:
+                            delay = _CAPACITY_CONTINUATION_DELAYS[
+                                capacity_continuations_in_session
+                            ]
+                            next_reason = "capacity"
+                        elif can_continue_transient:
+                            delay = _TRANSIENT_CONTINUATION_DELAYS[
+                                transient_continuations_in_session
+                            ]
+                            next_reason = (
+                                "remote_compact"
+                                if error.details.get(
+                                    "remote_compact_failed"
+                                )
+                                is True
+                                else "reconnect"
                             )
-                            capacity_continuation += 1
-                            capacity_continuations_used += 1
+                        else:
+                            delay = None
+                            next_reason = None
+                        can_continue_session = (
+                            delay is not None and next_reason is not None
+                        )
+                        if can_continue_session:
+                            await asyncio.sleep(delay)
+                            session_continuation += 1
+                            if next_reason == "capacity":
+                                capacity_continuations_in_session += 1
+                                capacity_continuations_used += 1
+                            else:
+                                transient_continuations_in_session += 1
+                                transient_continuations_used += 1
+                            continuation_reason = next_reason
                             resume_thread_id = thread_id
                             continue
                         terminal_error = error
@@ -1945,6 +2083,8 @@ class CodexExecClient:
                     f"Codex exec {disposition} after {exec_index + 1} "
                     "SimpleTES exec attempt(s) plus "
                     f"{capacity_continuations_used} in-session capacity "
+                    "continuation(s) and "
+                    f"{transient_continuations_used} in-session transient "
                     f"continuation(s); sanitized_trace={trace_json}",
                     details={
                         **terminal_error.details,
@@ -1953,6 +2093,12 @@ class CodexExecClient:
                         "capacity_continuations": capacity_continuations_used,
                         "max_capacity_continuations": (
                             self.max_capacity_continuations
+                        ),
+                        "transient_continuations": (
+                            transient_continuations_used
+                        ),
+                        "max_transient_continuations": (
+                            self.max_transient_continuations
                         ),
                     },
                     artifact_paths=tuple(artifact_paths),

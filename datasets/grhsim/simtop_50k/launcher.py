@@ -41,6 +41,7 @@ DEFAULT_LLM_TIMEOUT = 10_800.0
 DEFAULT_CODEX_MAX_AGENT_THREADS = 3
 DEFAULT_CODEX_EXEC_RETRIES = 2
 DEFAULT_CODEX_CAPACITY_CONTINUATIONS = 3
+DEFAULT_CODEX_TRANSIENT_CONTINUATIONS = 3
 DEFAULT_PREFLIGHT_TIMEOUT = 600.0
 PREFLIGHT_ATTEMPT_ARTIFACT_ROOT = (
     SIMPLETES_ROOT
@@ -109,6 +110,17 @@ def _selected_codex_capacity_continuations(args: argparse.Namespace) -> int:
     )
     if type(continuations) is not int or not 0 <= continuations <= 8:
         raise SystemExit("--codex-capacity-continuations must be in 0..8")
+    return continuations
+
+
+def _selected_codex_transient_continuations(args: argparse.Namespace) -> int:
+    continuations = getattr(
+        args,
+        "codex_transient_continuations",
+        DEFAULT_CODEX_TRANSIENT_CONTINUATIONS,
+    )
+    if type(continuations) is not int or not 0 <= continuations <= 8:
+        raise SystemExit("--codex-transient-continuations must be in 0..8")
     return continuations
 
 
@@ -591,6 +603,9 @@ def run_codex_preflight(args: argparse.Namespace) -> int:
     reasoning_effort = _selected_reasoning_effort(args)
     codex_exec_retries = _selected_codex_exec_retries(args)
     codex_capacity_continuations = _selected_codex_capacity_continuations(args)
+    codex_transient_continuations = _selected_codex_transient_continuations(
+        args
+    )
     is_k3 = model == "k3"
     output_mode = "local-json" if is_k3 else "provider-structured"
     tool_choice_mode = "required-first" if is_k3 else "auto"
@@ -654,6 +669,7 @@ def run_codex_preflight(args: argparse.Namespace) -> int:
             runtime_home_dir=str(PREFLIGHT_RUNTIME_HOME_ROOT),
             max_exec_retries=codex_exec_retries,
             max_capacity_continuations=codex_capacity_continuations,
+            max_transient_continuations=codex_transient_continuations,
         )
     except ValueError as error:
         raise SystemExit(
@@ -709,6 +725,9 @@ def build_command(args: argparse.Namespace) -> tuple[list[str], dict[str, str]]:
     reasoning_effort = _selected_reasoning_effort(args)
     codex_exec_retries = _selected_codex_exec_retries(args)
     codex_capacity_continuations = _selected_codex_capacity_continuations(args)
+    codex_transient_continuations = _selected_codex_transient_continuations(
+        args
+    )
     is_k3 = model == "k3"
     output_mode = "local-json" if is_k3 else "provider-structured"
     tool_choice_mode = "required-first" if is_k3 else "auto"
@@ -852,6 +871,8 @@ def build_command(args: argparse.Namespace) -> tuple[list[str], dict[str, str]]:
         str(codex_exec_retries),
         "--codex-capacity-continuations",
         str(codex_capacity_continuations),
+        "--codex-transient-continuations",
+        str(codex_transient_continuations),
         "--max-tokens",
         str(args.max_tokens),
         "--disable-reflection",
@@ -1004,6 +1025,16 @@ def main() -> int:
             "In-session Codex 'continue' turns for model-at-capacity before "
             "using a normal exec retry "
             f"(default: {DEFAULT_CODEX_CAPACITY_CONTINUATIONS})"
+        ),
+    )
+    parser.add_argument(
+        "--codex-transient-continuations",
+        type=int,
+        default=DEFAULT_CODEX_TRANSIENT_CONTINUATIONS,
+        help=(
+            "In-session Codex 'continue' turns for remote-compaction and "
+            "reconnect/stream failures before using a normal exec retry "
+            f"(default: {DEFAULT_CODEX_TRANSIENT_CONTINUATIONS})"
         ),
     )
     parser.add_argument(

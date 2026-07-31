@@ -159,6 +159,7 @@ class EngineConfig:
     codex_max_agent_threads: int | None = None
     codex_model_catalog_path: str | None = None
     codex_capacity_continuations: int = 3
+    codex_transient_continuations: int = 3
 
     # Token forcing (vllm_token_forcing backend)
     reasoning_budget: int | None = 32768  # Phase 1 total budget (prompt + reasoning). None = auto from context_window - response_budget
@@ -255,6 +256,7 @@ def build_config_from_args(args: Any) -> EngineConfig:
         codex_max_agent_threads=args.codex_max_agent_threads,
         codex_model_catalog_path=args.codex_model_catalog,
         codex_capacity_continuations=args.codex_capacity_continuations,
+        codex_transient_continuations=args.codex_transient_continuations,
         reflection_mode=not args.disable_reflection,
         output_path=args.output_path,
         log_interval=args.log_interval,

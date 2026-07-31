@@ -80,6 +80,17 @@ thread ID was emitted) does the current `--codex-exec-retries` policy apply.
 The default is three continuations with 1/2/5-second delays; set
 `--codex-capacity-continuations 0` to disable them.
 
+Remote-compaction failures and terminal reconnect/stream failures
+(`Reconnecting...`, `stream disconnected before completion`, or
+`Upstream request failed`) use the same exact-thread mechanism with a separate
+budget. Their `continue` turns do not consume either the capacity budget or a
+normal SimpleTES retry. After that budget is exhausted—or if the failed stream
+did not emit a safe thread ID—the normal exec retry starts a fresh conversation.
+The default is three transient continuations with 1/2/5-second delays; set
+`--codex-transient-continuations 0` to disable them. Complete failure JSONL,
+stderr, final-output, and classification metadata are retained for every failed
+turn before any continuation is attempted.
+
 Defaults:
 
 - target checkout: sibling `wolvrix-playground-gsim-calibrate-5`
@@ -92,7 +103,8 @@ Defaults:
 - config: `~/.codex/config.kimi.toml`
 - auth: `~/.codex/auth.kimi.json`
 - capability preflight timeout: `600 s` (independent of generation timeout)
-- Codex capacity continuations / normal exec retries: `3` / `2`
+- Codex capacity continuations / transient continuations / normal exec retries:
+  `3` / `3` / `2`
 - initial program: `datasets/grhsim/simtop_50k/init_program.txt`
 - evaluator slots: `/tmp/simpletes-grhsim-simtop-50k`
 - checkpoints: `SimpleTES/checkpoints/grhsim_simtop_50k/<timestamp>`

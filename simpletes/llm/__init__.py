@@ -80,6 +80,9 @@ def create_llm_client(
             pool_size=config.gen_concurrency,
             max_exec_retries=config.retry,
             max_capacity_continuations=config.codex_capacity_continuations,
+            max_transient_continuations=(
+                config.codex_transient_continuations
+            ),
         )
     if config.llm_backend == "vllm_token_forcing":
         return VLLMTokenForcingClient(

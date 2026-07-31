@@ -2076,6 +2076,7 @@ def test_launcher_accepts_long_bounded_continuation_and_rejects_oversize_budget(
     assert "--max-valid-evaluations 16" in rendered
     assert "--timeout 5400.0" in rendered
     assert "--codex-capacity-continuations 3" in rendered
+    assert "--codex-transient-continuations 3" in rendered
 
     args.gen_concurrency = 0
     with pytest.raises(SystemExit, match=r"--gen-concurrency must be in 1\.\.4"):
@@ -2107,6 +2108,15 @@ def test_launcher_accepts_long_bounded_continuation_and_rejects_oversize_budget(
         launcher.build_command(args)
     args.codex_capacity_continuations = (
         launcher.DEFAULT_CODEX_CAPACITY_CONTINUATIONS
+    )
+    args.codex_transient_continuations = -1
+    with pytest.raises(
+        SystemExit,
+        match=r"--codex-transient-continuations must be in 0\.\.8",
+    ):
+        launcher.build_command(args)
+    args.codex_transient_continuations = (
+        launcher.DEFAULT_CODEX_TRANSIENT_CONTINUATIONS
     )
     args.max_proposals = launcher.MAX_PROPOSALS + 1
     with pytest.raises(SystemExit, match=r"--max-proposals must be in 1\.\.64"):
@@ -2637,6 +2647,7 @@ def test_launcher_capability_preflight_is_repo_grounded_and_research_free(
     assert captured["kwargs"]["max_agent_threads"] == 3
     assert captured["kwargs"]["max_exec_retries"] == 2
     assert captured["kwargs"]["max_capacity_continuations"] == 3
+    assert captured["kwargs"]["max_transient_continuations"] == 3
     assert captured["kwargs"]["attempt_artifact_dir"] == str(
         launcher.PREFLIGHT_ATTEMPT_ARTIFACT_ROOT
     )

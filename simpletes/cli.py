@@ -456,6 +456,17 @@ def build_parser(*, mode: str = "single") -> argparse.ArgumentParser:
             f"(default: {EngineConfig.codex_capacity_continuations})"
         ),
     )
+    parser.add_argument(
+        "--codex-transient-continuations",
+        type=int,
+        default=EngineConfig.codex_transient_continuations,
+        help=(
+            "(codex_exec) In-session 'continue' turns attempted for remote "
+            "compaction and reconnect/stream failures before consuming a "
+            "normal LLM retry "
+            f"(default: {EngineConfig.codex_transient_continuations})"
+        ),
+    )
     # Resume
     parser.add_argument("--resume", type=str, help="Checkpoint path to resume from")
 

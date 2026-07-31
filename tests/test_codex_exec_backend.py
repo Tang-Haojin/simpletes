@@ -121,6 +121,7 @@ home = pathlib.Path(os.environ["CODEX_HOME"])
 record = {
     "args": args,
     "home": str(home),
+    "cwd": os.getcwd(),
     "home_mode": stat.S_IMODE(home.stat().st_mode),
     "config_mode": stat.S_IMODE((home / "config.toml").stat().st_mode),
     "model_catalog_exists": (home / "model_catalog.json").exists(),
@@ -1335,6 +1336,8 @@ def test_capacity_continues_exact_session_without_consuming_exec_retry(
     assert initial["prompt"] == "original prompt"
     assert resumed["prompt"] == "continue"
     assert initial["home"] == resumed["home"]
+    assert initial["cwd"] == str(paths["repo"])
+    assert resumed["cwd"] == str(paths["repo"])
     assert not Path(initial["home"]).exists()
     assert initial["args"][:3] == ["-a", "never", "exec"]
     assert initial["args"][3] != "resume"
@@ -1351,6 +1354,173 @@ def test_capacity_continues_exact_session_without_consuming_exec_retry(
     assert metadata["exec_attempt"] == 1
     assert metadata["capacity_continuation"] == 0
     assert metadata["conversation_mode"] == "start"
+
+
+@pytest.mark.parametrize(
+    ("diagnostic", "expected_remote_compact", "expected_reconnect"),
+    [
+        (
+            "Error running remote compact task: Fatal error: remote "
+            "compaction v2 expected exactly one compaction output item, "
+            "got 0 from 1 output items",
+            True,
+            False,
+        ),
+        (
+            "Reconnecting... 1/5 (stream disconnected before completion: "
+            "Upstream request failed)",
+            False,
+            True,
+        ),
+    ],
+)
+def test_transient_failure_continues_exact_session_without_exec_retry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    diagnostic: str,
+    expected_remote_compact: bool,
+    expected_reconnect: bool,
+) -> None:
+    paths = _make_inputs(tmp_path)
+    _set_fake_sequence(
+        paths,
+        [
+            {
+                "status": 7,
+                "events": [
+                    {"type": "thread.started", "thread_id": "fake-thread"},
+                    {"type": "error", "message": diagnostic},
+                ],
+            },
+            {"response": {"schema_version": 1, "patch": "continued\n"}},
+        ],
+    )
+    artifact_root = tmp_path / "checkpoint" / "llm_attempts"
+    monkeypatch.setattr(
+        "simpletes.llm.codex_exec._TRANSIENT_CONTINUATION_DELAYS",
+        (0.0,) * 8,
+    )
+
+    result = asyncio.run(
+        _client(
+            paths,
+            attempt_artifact_dir=str(artifact_root),
+            max_exec_retries=0,
+            max_capacity_continuations=0,
+            max_transient_continuations=1,
+        ).generate("original prompt", track_io=True)
+    )
+    tracked = json.loads(result.raw_output or "")
+    invocations = [
+        json.loads(
+            (tmp_path / f"invocation-{index}.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        for index in range(2)
+    ]
+
+    assert tracked["response"]["patch"] == "continued\n"
+    assert [item["prompt"] for item in invocations] == [
+        "original prompt",
+        "continue",
+    ]
+    assert invocations[0]["args"][3] != "resume"
+    assert invocations[1]["args"][:4] == ["-a", "never", "exec", "resume"]
+    assert invocations[1]["args"][-2:] == ["fake-thread", "-"]
+    assert len({item["home"] for item in invocations}) == 1
+    assert {item["cwd"] for item in invocations} == {str(paths["repo"])}
+
+    artifact_paths = tracked["simpletes_codex_rejected_response_artifacts"]
+    assert len(artifact_paths) == 1
+    metadata = json.loads(
+        (artifact_root.parent / artifact_paths[0]).read_text(encoding="utf-8")
+    )
+    details = metadata["error_details"]
+    assert details["retryable"] is True
+    assert details["capacity_limited"] is False
+    assert details["remote_compact_failed"] is expected_remote_compact
+    assert details["reconnect_failed"] is expected_reconnect
+    assert details["transient_session_failure"] is True
+    assert metadata["session_continuation"] == 0
+    assert metadata["continuation_reason"] is None
+
+
+def test_transient_continuation_exhaustion_then_uses_exec_retry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paths = _make_inputs(tmp_path)
+    reconnect = (
+        "Reconnecting... 1/5 (stream disconnected before completion: "
+        "Upstream request failed)"
+    )
+    failed_events = [
+        {"type": "thread.started", "thread_id": "fake-thread"},
+        {"type": "error", "message": reconnect},
+    ]
+    _set_fake_sequence(
+        paths,
+        [
+            {"status": 7, "events": failed_events},
+            {"status": 7, "events": failed_events},
+            {"response": {"schema_version": 1, "patch": "fresh retry\n"}},
+        ],
+    )
+    artifact_root = tmp_path / "checkpoint" / "llm_attempts"
+    monkeypatch.setattr(
+        "simpletes.llm.codex_exec._TRANSIENT_CONTINUATION_DELAYS",
+        (0.0,) * 8,
+    )
+    monkeypatch.setattr(
+        "simpletes.llm.codex_exec._EXEC_RETRY_DELAYS", (0.0, 0.0, 0.0)
+    )
+
+    result = asyncio.run(
+        _client(
+            paths,
+            attempt_artifact_dir=str(artifact_root),
+            max_exec_retries=1,
+            max_capacity_continuations=0,
+            max_transient_continuations=1,
+        ).generate("original prompt", track_io=True)
+    )
+    tracked = json.loads(result.raw_output or "")
+    invocations = [
+        json.loads(
+            (tmp_path / f"invocation-{index}.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        for index in range(3)
+    ]
+
+    assert tracked["response"]["patch"] == "fresh retry\n"
+    assert [item["prompt"] for item in invocations] == [
+        "original prompt",
+        "continue",
+        "original prompt",
+    ]
+    assert invocations[1]["args"][3] == "resume"
+    assert invocations[2]["args"][3] != "resume"
+    assert {item["cwd"] for item in invocations} == {str(paths["repo"])}
+
+    metadata = [
+        json.loads(
+            (artifact_root.parent / path).read_text(encoding="utf-8")
+        )
+        for path in tracked["simpletes_codex_rejected_response_artifacts"]
+    ]
+    assert len(metadata) == 2
+    assert [item["session_continuation"] for item in metadata] == [0, 1]
+    assert [item["continuation_reason"] for item in metadata] == [
+        None,
+        "reconnect",
+    ]
+    assert [item["conversation_mode"] for item in metadata] == [
+        "start",
+        "resume",
+    ]
 
 
 def test_capacity_continuation_exhaustion_then_uses_exec_retry(
@@ -1657,6 +1827,18 @@ def test_codex_capacity_continuation_count_is_bounded(
         _client(paths, max_capacity_continuations=continuations)
 
 
+@pytest.mark.parametrize("continuations", [-1, 9, True])
+def test_codex_transient_continuation_count_is_bounded(
+    tmp_path: Path, continuations: object
+) -> None:
+    paths = _make_inputs(tmp_path)
+
+    with pytest.raises(
+        ValueError, match="max_transient_continuations must be in 0..8"
+    ):
+        _client(paths, max_transient_continuations=continuations)
+
+
 def test_codex_attempt_artifact_root_rejects_symbolic_link(
     tmp_path: Path,
 ) -> None:
@@ -1920,6 +2102,7 @@ def test_cli_builds_local_validation_overlay_config(tmp_path: Path) -> None:
     assert config.codex_max_agent_threads == 2
     assert config.codex_model_catalog_path == str(paths["model_catalog"])
     assert config.codex_capacity_continuations == 3
+    assert config.codex_transient_continuations == 3
 
 
 def test_factory_passes_overlay_and_repairs_empty_provider_response(
@@ -1950,6 +2133,7 @@ def test_factory_passes_overlay_and_repairs_empty_provider_response(
         codex_model_catalog_path=str(paths["model_catalog"]),
         retry=2,
         codex_capacity_continuations=4,
+        codex_transient_continuations=5,
         timeout=10,
     )
 
@@ -1957,6 +2141,7 @@ def test_factory_passes_overlay_and_repairs_empty_provider_response(
     assert isinstance(client, CodexExecClient)
     assert client.max_exec_retries == 2
     assert client.max_capacity_continuations == 4
+    assert client.max_transient_continuations == 5
     client.codex_binary = str(paths["executable"])
     result = asyncio.run(client.generate("factory prompt", track_io=True))
     tracked = json.loads(result.raw_output or "")

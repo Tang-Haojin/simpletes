@@ -3,18 +3,21 @@
 This bench evolves a schema-v2 structured JSON candidate whose payload is a
 safe unified diff against the pinned `wolvrix` revision and whose
 `candidate_mode` declares its attribution path. The evaluator never edits the
-user checkout: it creates a locked local clone, verifies parent `d31118b` and
-`wolvrix` `16a9f49`, applies the patch only inside that slot, runs the
+user checkout: it creates a locked local clone, verifies parent `de37459` and
+`wolvrix` `fd12d83`, applies the patch only inside that slot, runs the
 mode-specific generated-source attribution gates, builds a real local ELF,
 runs fixed-ASLR function gates, and hands resolved artifacts to the trusted
 runtime.
 
-This pin pair is the fresh post-RWA control namespace. Native defaults already
+This pin pair is the fresh post-four-positive control namespace. Native defaults already
 contain R (cold register-write guard admission/group hints), W (singleton
 memory-write hints only inside an R-admitted run), and A (eligible adjacent
-SystemTask/`xs_assert_v2` outer-guard nesting). The MemoryFill F tier did not
-land. R/W/A must not be rediscovered or claimed by a candidate, and F is a
-closed prior direction that must not be reproposed.
+SystemTask/`xs_assert_v2` outer-guard nesting). They also contain cold
+SystemTask/eligible standalone `xs_assert_v2` guards, always-inline hot word
+helpers, direct in-range constant MemoryRead row loads without a redundant zero
+pass, and cold dynamic scalar-shift/index bounds fallbacks. The MemoryFill F,
+residual dynamic MemoryRead hint, and physical zero-tail mechanisms did not
+land. None of these landed or closed directions may be reproposed.
 
 The score is `control_mean_walltime_ms / candidate_mean_walltime_ms`. Absolute
 control and candidate `Host time spent` values and their millisecond/percentage
@@ -23,7 +26,7 @@ data are diagnostics, not substitute objectives. Retryable host-load or audit
 failures are retried as the same candidate and do not count toward the valid
 candidate budget.
 
-## Start fresh, then continue only within the post-RWA pins
+## Start fresh, then continue only within the post-four-positive pins
 
 The launcher fixes the requested model to Codex-compatible `k3` with reasoning
 effort `ultra`, uses four RPUCG chains with `k=1`, runs four generation workers
@@ -105,15 +108,15 @@ checkpoint whose recorded evaluator metrics use different parent/wolvrix pins.
 New checkpoints also record the non-sensitive Codex model effort, output mode,
 tool-choice mode, config/repository path, and provider/local schema paths while
 deliberately excluding the auth path and all API keys.
-In particular, an old pre-RWA checkpoint is rejected for both `--resume` and
-explicit `best_program.txt` seeding.
+In particular, an old `d31118b`/`16a9f49` or pre-RWA checkpoint is rejected for
+both `--resume` and explicit `best_program.txt` seeding.
 
 ```bash
 ./.venv/bin/python datasets/grhsim/simtop_50k/launcher.py \
-  --resume checkpoints/grhsim_simtop_50k/<post-rwa-run>/<date>/instance-<id>
+  --resume checkpoints/grhsim_simtop_50k/<post-four-positive-run>/<date>/instance-<id>
 ```
 
-An exhausted post-RWA checkpoint may be extended in place only with the
+An exhausted post-four-positive checkpoint may be extended in place only with the
 explicit `--extend-resume-budget` opt-in. Both limits are absolute totals, not
 increments. The engine preserves the existing nodes, scores, attempt/valid
 counters, per-chain prompt counts, histories, and failure records; it
@@ -127,7 +130,7 @@ the same cumulative target of `32` valid candidates:
 ```bash
 GRHSIM_INFRA_RETRIES=8 \
 ./.venv/bin/python datasets/grhsim/simtop_50k/launcher.py \
-  --resume checkpoints/grhsim_simtop_50k/<post-rwa-run>/<date>/instance-<id>/db_state_<time> \
+  --resume checkpoints/grhsim_simtop_50k/<post-four-positive-run>/<date>/instance-<id>/db_state_<time> \
   --extend-resume-budget \
   --max-proposals 192 \
   --valid-target 32
@@ -139,13 +142,13 @@ tree and counters:
 
 ```bash
 ./.venv/bin/python datasets/grhsim/simtop_50k/launcher.py \
-  --init-program checkpoints/grhsim_simtop_50k/<post-rwa-run>/<date>/instance-<id>/db_state_<time>/best_program.txt
+  --init-program checkpoints/grhsim_simtop_50k/<post-four-positive-run>/<date>/instance-<id>/db_state_<time>/best_program.txt
 ```
 
 The seed must be a regular, non-symlink file containing a complete marked
 schema-v2 candidate document. A checkpoint `best_program.txt` seed must also
 match a sibling node whose recorded parent/wolvrix pins equal this evaluator's
-new `d31118b`/`16a9f49` pins. It is evaluated again as the new instance's
+new `de37459`/`fd12d83` pins. It is evaluated again as the new instance's
 initial node; that initial evaluation does not consume a proposal or
 valid-candidate slot.
 Omit `--resume` for this continuation so the launcher creates a fresh checkpoint
@@ -160,7 +163,7 @@ the proposal budget. For example, a doubled fresh search uses:
 ```bash
 GRHSIM_INFRA_RETRIES=4 \
 ./.venv/bin/python datasets/grhsim/simtop_50k/launcher.py \
-  --init-program checkpoints/grhsim_simtop_50k/<post-rwa-run>/<date>/instance-<id>/db_state_<time>/best_program.txt \
+  --init-program checkpoints/grhsim_simtop_50k/<post-four-positive-run>/<date>/instance-<id>/db_state_<time>/best_program.txt \
   --max-proposals 32 \
   --valid-target 16 \
   --llm-timeout 10800 \
@@ -236,9 +239,10 @@ must not be borrowed as a generic optimization gate. That independent mechanism
 uses `commit_exact_event_policy`; refinements to behavior already selected by
 the native C++ default belong in `default-path` mode.
 
-The landed R/W/A source is part of that native control, not candidate space.
-The unlanded F MemoryFill tier is closed as well. Do not submit any candidate
-that recreates R, W, A, or F under another patch shape or option. The
+The landed R/W/A and four-positive source is part of that native control, not
+candidate space. The unlanded F MemoryFill, residual MemoryRead, and physical
+zero-tail mechanisms are closed as well. Do not submit any candidate that
+recreates those mechanisms under another patch shape or option. The
 `materialize_ablation.py --compose-rwa` path remains pinned to historical
 Wolvrix `8f6ba14` solely to reproduce prior ablation evidence; it does not
 define the current evaluator baseline and its output must not seed this

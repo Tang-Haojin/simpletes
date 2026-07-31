@@ -18,6 +18,8 @@ ROOT = Path(__file__).resolve().parents[1]
 TASK_ROOT = ROOT / "datasets" / "grhsim" / "simtop_50k"
 OLD_PRE_RWA_PARENT_COMMIT = "fbe4e1cbbfcf45b52960545377020cb761c3ab25"
 OLD_PRE_RWA_WOLVRIX_COMMIT = "8f6ba14397b0c3d00cb909153af1c6464f4f1ed9"
+OLD_RWA_PARENT_COMMIT = "d31118bea0feb563ad09476e1419f0f15aaf574f"
+OLD_RWA_WOLVRIX_COMMIT = "16a9f493687a21a5428f1e1327a69834ea60c9f5"
 
 
 def _load(name: str, path: Path):
@@ -223,7 +225,10 @@ def test_seed_and_schema_are_valid_and_pinned():
     assert any("Native R lowers" in item for item in candidate.evidence)
     assert any("Native W cold-hints" in item for item in candidate.evidence)
     assert any("Native A nests" in item for item in candidate.evidence)
+    assert any("Native four-positive landing" in item for item in candidate.evidence)
     assert any("MemoryFill F tier is not present" in item for item in candidate.evidence)
+    assert any("residual dynamic MemoryRead hint" in item for item in candidate.evidence)
+    assert any("physical zero-tail mechanism" in item for item in candidate.evidence)
     assert schema["properties"]["schema_version"]["const"] == 2
     assert schema["properties"]["candidate_mode"]["enum"] == [
         "default-path",
@@ -254,13 +259,15 @@ def test_seed_and_schema_are_valid_and_pinned():
         "WOLVRIX_XS_GRHSIM_COMMIT_EXACT_EVENT_POLICY": "targeted-cold-layout"
     }
     assert evaluator.PINNED_PARENT_COMMIT == (
-        "d31118bea0feb563ad09476e1419f0f15aaf574f"
+        "de37459cdd210794fa5d7423e6f32c145cf71261"
     )
     assert evaluator.PINNED_WOLVRIX_COMMIT == (
-        "16a9f493687a21a5428f1e1327a69834ea60c9f5"
+        "fd12d83f5150cc98540ed3e8f2af3b79f8054da0"
     )
     assert evaluator.PINNED_PARENT_COMMIT != OLD_PRE_RWA_PARENT_COMMIT
     assert evaluator.PINNED_WOLVRIX_COMMIT != OLD_PRE_RWA_WOLVRIX_COMMIT
+    assert evaluator.PINNED_PARENT_COMMIT != OLD_RWA_PARENT_COMMIT
+    assert evaluator.PINNED_WOLVRIX_COMMIT != OLD_RWA_WOLVRIX_COMMIT
 
 
 def test_model_output_schema_rejects_control_proposals():
@@ -2202,8 +2209,8 @@ def test_launcher_rejects_legacy_seed_and_pre_rwa_best_program(tmp_path: Path):
     _write_v2_checkpoint_seed(
         wrong_pin,
         pin_override=(
-            OLD_PRE_RWA_PARENT_COMMIT[:12],
-            OLD_PRE_RWA_WOLVRIX_COMMIT[:12],
+            OLD_RWA_PARENT_COMMIT[:12],
+            OLD_RWA_WOLVRIX_COMMIT[:12],
         ),
     )
     args.init_program = wrong_pin

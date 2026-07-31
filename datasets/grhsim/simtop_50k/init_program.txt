@@ -2,13 +2,15 @@
 {
   "schema_version": 2,
   "candidate_mode": "control",
-  "hypothesis": "Pinned post-RWA native-default control with no source modification or option override.",
+  "hypothesis": "Pinned post-four-positive native-default control with no source modification or option override.",
   "evidence": [
-    "This fresh control pins parent d31118bea0feb563ad09476e1419f0f15aaf574f and wolvrix 16a9f493687a21a5428f1e1327a69834ea60c9f5.",
+    "This fresh control pins parent de37459cdd210794fa5d7423e6f32c145cf71261 and wolvrix fd12d83f5150cc98540ed3e8f2af3b79f8054da0.",
     "Native R lowers cold register-guard admission to 256 singleton guards or 2048 eligible writes with a 2048-write group cap and known-nonzero exclusion.",
     "Native W cold-hints only singleton MemoryWritePort guards inside an R-admitted run; memory writes do not admit a run.",
     "Native A nests an eligible adjacent SystemTask plus xs_assert_v2 DPIC pair under one outer unlikely guard while retaining the inner DPIC recheck.",
-    "The MemoryFill F tier is not present in this baseline and is a closed prior direction; R, W, A, and F must not be reproposed."
+    "Native four-positive landing cold-hints SystemTask and eligible xs_assert_v2 side effects, always-inlines selected hot word helpers, proves in-range constant MemoryRead rows and removes their redundant zero pass, and cold-hints dynamic scalar shift plus index bounds fallbacks.",
+    "The MemoryFill F tier is not present in this baseline and remains a closed prior direction.",
+    "The residual dynamic MemoryRead hint and physical zero-tail mechanism are also not present and are closed prior directions; R, W, A, these four landed mechanisms, F, residual MemoryRead, and physical zero-tail must not be reproposed."
   ],
   "patch": "",
   "enable_options": []

@@ -19,9 +19,9 @@ walltime. Cycles, instructions, generated-source size, ELF sections, BAE, DAG
 edges, PMU counters, and profiles are diagnostic evidence only. A change is
 useful only if the fixed-ASLR, functionally equivalent end-to-end run improves.
 
-This is the fresh post-four-positive baseline at parent
-`de37459cdd210794fa5d7423e6f32c145cf71261` and Wolvrix
-`fd12d83f5150cc98540ed3e8f2af3b79f8054da0`. R (cold register-guard
+This is the fresh post-principled-hot-event baseline at parent
+`52ba7d9edcd713cd0ee3d8a605f1d4aa31b3c730` and Wolvrix
+`d3ed9dea975bddf01185dde5c548a69241a09de9`. R (cold register-guard
 admission and group hints), W (singleton MemoryWritePort hints inside an
 R-admitted run), and A (adjacent SystemTask plus `xs_assert_v2` outer-guard
 nesting) are already native-default behavior. Do not propose, reconstruct, or
@@ -31,7 +31,14 @@ word helpers, in-range constant MemoryRead row proof with its redundant zero
 pass removed, and cold dynamic scalar-shift/index bounds fallbacks. Do not
 repropose any of those mechanisms. The MemoryFill F tier, residual dynamic
 MemoryRead hint, and physical zero-tail mechanism did not land and are closed
-prior directions. Research a distinct mechanism.
+prior directions. The native principled hot-event mechanism is also already
+landed: it structurally selects an input event from reusable exact-posedge
+demand above a fixed materialize-and-clear cost, remaps it to typed slot zero,
+predecodes exact posedge as a bool, and snapshots that bool per covered batch;
+residual negedge/general queries retain enum handling. Its selector uses no port
+name, SimTop/benchmark identity, ValueId, or raw event-slot-count threshold.
+Do not reconstruct HS, TRBS, or a renamed equivalent of this same mechanism.
+Research a distinct mechanism.
 
 Return exactly one JSON object matching `candidate.schema.json`. The backend
 will place it between the EVOLVE-BLOCK markers. Its fields mean:
@@ -43,7 +50,7 @@ will place it between the EVOLVE-BLOCK markers. Its fields mean:
 - `evidence`: repository paths plus absolute observed counts/timings/profile
   facts that motivated this candidate. Never invent measurements.
 - `patch`: a complete `git diff`-style unified diff relative to
-  `wolvrix@fd12d83f5150cc98540ed3e8f2af3b79f8054da0`. It must end with a
+  `wolvrix@d3ed9dea975bddf01185dde5c548a69241a09de9`. It must end with a
   newline.
 - `enable_options`: an array of `{ "name": snake_case, "value": ... }` entries.
   It must be empty for `default-path` and non-empty for `explicit-options`.
@@ -97,15 +104,17 @@ Hard constraints:
    It rejects invalid infrastructure samples rather than treating them as a
    performance result.
 6. Prefer a small, attributable candidate. Do not bundle unrelated ideas.
-7. Treat the landed R/W/A implementation, the four landed hot-path mechanisms,
-   and the rejected F/residual-MemoryRead/physical-zero-tail mechanisms as
-   immutable baseline history. A patch that repeats any of them is invalid,
-   even if it renames the policy or moves the same logic elsewhere.
+7. Treat the landed R/W/A implementation, the four earlier landed hot-path
+   mechanisms, the principled hot-event mechanism, and the rejected
+   F/residual-MemoryRead/physical-zero-tail mechanisms as immutable baseline
+   history. A patch that repeats any of them is invalid, even if it renames the
+   policy or moves the same logic elsewhere.
 
-The first program in this post-four-positive namespace is the schema-v2 special no-op
+The first program in this post-principled-hot-event namespace is the schema-v2 special no-op
 `control`. A later fresh continuation may use a previously evaluated best
 candidate only when its checkpoint records these exact new parent/Wolvrix
-pins. Never resume from or seed with an older `d31118b`/`16a9f49` or pre-RWA
-`fbe4e1c`/`8f6ba14` checkpoint; it is relative to a different baseline. Regardless of the valid seed, every
-newly generated candidate must contain a non-empty patch and select exactly one
-of the two non-control modes above.
+pins. Never resume from or seed with an older `de37459`/`fd12d83`,
+`d31118b`/`16a9f49`, or pre-RWA `fbe4e1c`/`8f6ba14` checkpoint; it is relative
+to a different baseline. Regardless of the valid seed, every newly generated
+candidate must contain a non-empty patch and select exactly one of the two
+non-control modes above.

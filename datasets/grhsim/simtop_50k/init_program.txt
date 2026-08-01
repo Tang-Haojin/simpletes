@@ -2,15 +2,17 @@
 {
   "schema_version": 2,
   "candidate_mode": "control",
-  "hypothesis": "Pinned post-four-positive native-default control with no source modification or option override.",
+  "hypothesis": "Pinned post-principled-hot-event native-default control with no source modification or option override.",
   "evidence": [
-    "This fresh control pins parent de37459cdd210794fa5d7423e6f32c145cf71261 and wolvrix fd12d83f5150cc98540ed3e8f2af3b79f8054da0.",
+    "This fresh control pins parent 52ba7d9edcd713cd0ee3d8a605f1d4aa31b3c730 and wolvrix d3ed9dea975bddf01185dde5c548a69241a09de9.",
     "Native R lowers cold register-guard admission to 256 singleton guards or 2048 eligible writes with a 2048-write group cap and known-nonzero exclusion.",
     "Native W cold-hints only singleton MemoryWritePort guards inside an R-admitted run; memory writes do not admit a run.",
     "Native A nests an eligible adjacent SystemTask plus xs_assert_v2 DPIC pair under one outer unlikely guard while retaining the inner DPIC recheck.",
     "Native four-positive landing cold-hints SystemTask and eligible xs_assert_v2 side effects, always-inlines selected hot word helpers, proves in-range constant MemoryRead rows and removes their redundant zero pass, and cold-hints dynamic scalar shift plus index bounds fallbacks.",
+    "Native principled hot-event landing selects an input event only from reusable exact-posedge demand, remaps it to typed slot zero, predecodes exact posedge as a bool, and snapshots that bool per covered batch while retaining enum handling for residual negedge and general queries.",
+    "The hot-event gate uses reusable demand above a fixed materialize-and-clear cost with deterministic structural tie-breaking; it does not match port names, SimTop identity, ValueId, or a raw event-slot-count threshold.",
     "The MemoryFill F tier is not present in this baseline and remains a closed prior direction.",
-    "The residual dynamic MemoryRead hint and physical zero-tail mechanism are also not present and are closed prior directions; R, W, A, these four landed mechanisms, F, residual MemoryRead, and physical zero-tail must not be reproposed."
+    "The residual dynamic MemoryRead hint and physical zero-tail mechanism are also not present and are closed prior directions; R, W, A, the four earlier landed mechanisms, the principled hot-event mechanism, F, residual MemoryRead, and physical zero-tail must not be reproposed."
   ],
   "patch": "",
   "enable_options": []

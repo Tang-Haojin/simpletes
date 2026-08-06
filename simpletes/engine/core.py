@@ -16,6 +16,7 @@ _MIN_QUEUE_SIZE = 4096
 _INITIAL_SHARED_CONSTRUCTION_ENV = "SIMPLETES_INITIAL_SHARED_CONSTRUCTION_PATH"
 _RETRYABLE_EVAL_DEFAULT_DELAY_SEC = 30.0
 _RETRYABLE_EVAL_MAX_DELAY_SEC = 300.0
+_RETRYABLE_EVAL_DIAGNOSTIC_MAX_CHARS = 512
 
 from datetime import datetime, timezone
 import asyncio
@@ -32,6 +33,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 from rich.panel import Panel
+from rich.markup import escape
 
 from simpletes.evaluator import rich_print
 from simpletes.utils.log import format_log, install_tee_logger
@@ -87,6 +89,23 @@ def _retryable_evaluation_delay(metrics: Any) -> float | None:
     if not math.isfinite(delay):
         delay = _RETRYABLE_EVAL_DEFAULT_DELAY_SEC
     return min(max(delay, 1.0), _RETRYABLE_EVAL_MAX_DELAY_SEC)
+
+
+def _retryable_evaluation_diagnostic(metrics: Any) -> str | None:
+    """Return an explicitly scrubbed, bounded evaluator retry diagnostic."""
+    if not isinstance(metrics, dict):
+        return None
+    value = metrics.get("retry_diagnostic")
+    if not isinstance(value, str):
+        return None
+    diagnostic = " ".join(value.split())
+    if not diagnostic:
+        return None
+    if len(diagnostic) > _RETRYABLE_EVAL_DIAGNOSTIC_MAX_CHARS:
+        diagnostic = (
+            diagnostic[: _RETRYABLE_EVAL_DIAGNOSTIC_MAX_CHARS - 3] + "..."
+        )
+    return diagnostic
 
 
 # ============================================================================
@@ -530,11 +549,14 @@ class SimpleTESEngine(SchedulerMixin):
                     metrics=metrics,
                     captured_construction_payload=outcome.captured_construction_payload,
                 )
-            rich_print(self._log(
-                "⟳",
-                f"[yellow]Retryable evaluation infrastructure outcome; "
-                f"retrying the same candidate in {retry_delay:g}s[/yellow]",
-            ))
+            message = (
+                "[yellow]Retryable evaluation infrastructure outcome; "
+                f"retrying the same candidate in {retry_delay:g}s[/yellow]"
+            )
+            retry_diagnostic = _retryable_evaluation_diagnostic(metrics)
+            if retry_diagnostic is not None:
+                message += f"; diagnostic={escape(retry_diagnostic)}"
+            rich_print(self._log("⟳", message))
             if self._stop_event.is_set():
                 raise asyncio.CancelledError()
             await asyncio.sleep(retry_delay)

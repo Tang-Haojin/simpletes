@@ -9,6 +9,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from simpletes.engine.core import (
     _counts_toward_valid_budget,
     _retryable_evaluation_delay,
+    _retryable_evaluation_diagnostic,
 )
 from simpletes.engine.scheduler import SchedulerMixin
 from simpletes.node import Node
@@ -50,3 +51,16 @@ def test_retryable_infrastructure_metrics_get_a_bounded_delay():
     assert _retryable_evaluation_delay({"retryable": True, "retry_after_s": 0}) == 1.0
     assert _retryable_evaluation_delay({"retryable": True, "retry_after_s": 9999}) == 300.0
     assert _retryable_evaluation_delay({"valid_candidate": 1}) is None
+
+
+def test_retryable_diagnostic_requires_explicit_scrubbed_field_and_is_bounded():
+    assert _retryable_evaluation_diagnostic({"error": "not explicitly safe"}) is None
+    assert _retryable_evaluation_diagnostic({"retry_diagnostic": "  quiet\n CCD  "}) == (
+        "quiet CCD"
+    )
+    diagnostic = _retryable_evaluation_diagnostic(
+        {"retry_diagnostic": "x" * 2_000}
+    )
+    assert diagnostic is not None
+    assert len(diagnostic) == 512
+    assert diagnostic.endswith("...")

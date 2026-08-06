@@ -2677,6 +2677,62 @@ def test_launcher_capability_preflight_is_repo_grounded_and_research_free(
     assert "model_catalog=validated" in output
 
 
+def test_launcher_evaluator_toolchain_preflight_accepts_matching_scanner(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys,
+):
+    target = tmp_path / "target"
+    target.mkdir()
+    (target / "env.sh").write_text("true\n", encoding="utf-8")
+
+    def fake_run(command, **kwargs):
+        assert command[0:2] == ["bash", "-c"]
+        assert command[-1] == str((target / "env.sh").resolve())
+        assert kwargs["timeout"] == 60.0
+        return subprocess.CompletedProcess(
+            command,
+            0,
+            stdout=(
+                "compiler=/usr/bin/clang++\n"
+                "compiler_major=19\n"
+                "scanner=/usr/bin/clang-scan-deps-19\n"
+                "scanner_major=19\n"
+            ),
+            stderr="",
+        )
+
+    monkeypatch.setattr(launcher.subprocess, "run", fake_run)
+    args = SimpleNamespace(target_repo=target)
+
+    assert launcher.run_evaluator_toolchain_preflight(args) == 0
+    output = capsys.readouterr().out
+    assert "toolchain preflight passed" in output
+    assert "scanner=/usr/bin/clang-scan-deps-19" in output
+
+
+def test_launcher_evaluator_toolchain_preflight_reports_missing_matching_scanner(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+):
+    target = tmp_path / "target"
+    target.mkdir()
+    (target / "env.sh").write_text("true\n", encoding="utf-8")
+
+    monkeypatch.setattr(
+        launcher.subprocess,
+        "run",
+        lambda command, **_kwargs: subprocess.CompletedProcess(
+            command,
+            22,
+            stdout="compiler=/usr/bin/clang++\ncompiler_major=19\n",
+            stderr="",
+        ),
+    )
+
+    with pytest.raises(SystemExit, match="install clang-tools-19"):
+        launcher.run_evaluator_toolchain_preflight(
+            SimpleNamespace(target_repo=target)
+        )
+
+
 def test_launcher_capability_failure_includes_backend_scrubbed_diagnostic(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
 ):
@@ -2767,6 +2823,10 @@ def test_launcher_normal_entry_gates_before_spawning_main(monkeypatch):
         calls.append("capability-preflight")
         return 0
 
+    def fake_toolchain_preflight(_args):
+        calls.append("toolchain-preflight")
+        return 0
+
     def fake_run(command, **kwargs):
         calls.append("spawn")
         assert command == ["main-command"]
@@ -2774,6 +2834,9 @@ def test_launcher_normal_entry_gates_before_spawning_main(monkeypatch):
         return subprocess.CompletedProcess(command, 0)
 
     monkeypatch.setattr(launcher, "build_command", fake_build)
+    monkeypatch.setattr(
+        launcher, "run_evaluator_toolchain_preflight", fake_toolchain_preflight
+    )
     monkeypatch.setattr(launcher, "run_codex_preflight", fake_preflight)
     monkeypatch.setattr(
         launcher, "_launch_guard_digest", lambda _args, _command: "stable"
@@ -2782,13 +2845,21 @@ def test_launcher_normal_entry_gates_before_spawning_main(monkeypatch):
     monkeypatch.setattr(sys, "argv", ["launcher.py"])
 
     assert launcher.main() == 0
-    assert calls == ["build", "capability-preflight", "spawn"]
+    assert calls == [
+        "build",
+        "toolchain-preflight",
+        "capability-preflight",
+        "spawn",
+    ]
 
 
 def test_launcher_capability_failure_never_spawns_main(monkeypatch):
     monkeypatch.setattr(launcher, "build_command", lambda _args: (["main"], {}))
     monkeypatch.setattr(
         launcher, "_launch_guard_digest", lambda _args, _command: "stable"
+    )
+    monkeypatch.setattr(
+        launcher, "run_evaluator_toolchain_preflight", lambda _args: 0
     )
 
     def fail_gate(_args):
@@ -2815,6 +2886,9 @@ def test_launcher_refuses_spawn_when_inputs_change_during_preflight(monkeypatch)
     )
     monkeypatch.setattr(
         launcher, "run_codex_preflight", lambda _args: calls.append("preflight")
+    )
+    monkeypatch.setattr(
+        launcher, "run_evaluator_toolchain_preflight", lambda _args: None
     )
     monkeypatch.setattr(
         launcher.subprocess,

@@ -2118,6 +2118,9 @@ def score_runtime_result(result: Mapping[str, Any]) -> dict[str, Any]:
     retryable = bool(result.get("infrastructure_retry") or result.get("retryable_infra"))
     valid = bool(result.get("valid", not retryable))
     if retryable:
+        error = scrub_secrets(
+            result.get("error", "retryable infrastructure failure")
+        )
         return {
             "combined_score": 0.0,
             "validity": 0.0,
@@ -2125,7 +2128,8 @@ def score_runtime_result(result: Mapping[str, Any]) -> dict[str, Any]:
             "infrastructure_retry": 1.0,
             "retryable_infra": 1.0,
             "retry_after_s": 30.0,
-            "error": scrub_secrets(result.get("error", "retryable infrastructure failure")),
+            "error": error,
+            "retry_diagnostic": error,
             "diagnostics": scrub_secrets(result.get("diagnostics", {})),
         }
     if not valid:
@@ -2181,6 +2185,7 @@ def score_runtime_result(result: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def _failure(error: Exception, *, retryable: bool = False, elapsed: float = 0.0) -> dict[str, Any]:
+    message = scrub_secrets(f"{type(error).__name__}: {error}")
     return {
         "combined_score": 0.0,
         "validity": 0.0,
@@ -2189,7 +2194,8 @@ def _failure(error: Exception, *, retryable: bool = False, elapsed: float = 0.0)
         "retryable_infra": 1.0 if retryable else 0.0,
         **({"retry_after_s": 30.0} if retryable else {}),
         "eval_time": float(elapsed),
-        "error": scrub_secrets(f"{type(error).__name__}: {error}"),
+        "error": message,
+        **({"retry_diagnostic": message} if retryable else {}),
     }
 
 

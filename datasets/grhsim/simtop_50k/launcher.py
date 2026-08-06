@@ -76,6 +76,46 @@ PREFLIGHT_SMOKE_PATCH = (
 _PLACEHOLDER_RE = re.compile(
     r"\s*(?:placeholder|dummy|todo|tbd|unknown|n/?a)\s*[.!]?\s*", re.I
 )
+_EVALUATOR_TOOLCHAIN_PROBE = r"""
+set -euo pipefail
+source "$1" >/dev/null 2>&1
+
+compiler="$(command -v clang++ 2>/dev/null || true)"
+if [[ -z "$compiler" || ! -x "$compiler" ]]; then
+    exit 20
+fi
+compiler_version="$("$compiler" -dumpversion 2>/dev/null || true)"
+compiler_major="${compiler_version%%.*}"
+if [[ ! "$compiler_major" =~ ^[0-9]+$ ]]; then
+    exit 21
+fi
+printf 'compiler=%s\ncompiler_major=%s\n' "$compiler" "$compiler_major"
+
+scanner=""
+for candidate in \
+    clang-scan-deps \
+    "clang-scan-deps-${compiler_major}" \
+    "$(dirname "$compiler")/clang-scan-deps" \
+    "/usr/lib/llvm-${compiler_major}/bin/clang-scan-deps"
+do
+    resolved="$(command -v "$candidate" 2>/dev/null || true)"
+    if [[ -z "$resolved" || ! -x "$resolved" ]]; then
+        continue
+    fi
+    scanner_version="$("$resolved" --version 2>/dev/null || true)"
+    scanner_major="$(
+        sed -nE 's/^[^0-9]*([0-9]+).*/\1/p' <<<"$scanner_version" | head -n 1
+    )"
+    if [[ "$scanner_major" == "$compiler_major" ]]; then
+        scanner="$resolved"
+        break
+    fi
+done
+if [[ -z "$scanner" ]]; then
+    exit 22
+fi
+printf 'scanner=%s\nscanner_major=%s\n' "$scanner" "$compiler_major"
+"""
 
 
 def _selected_model(args: argparse.Namespace) -> str:
@@ -261,6 +301,68 @@ def _regular_file(path: Path, label: str) -> Path:
     if not resolved.is_file():
         raise SystemExit(f"{label} must be a regular file: {resolved}")
     return resolved
+
+
+def run_evaluator_toolchain_preflight(args: argparse.Namespace) -> int:
+    """Fail before provider use when the pinned evaluator cannot fresh-build."""
+    target_repo = args.target_repo.expanduser().resolve()
+    target_env = _regular_file(target_repo / "env.sh", "target env.sh")
+    try:
+        completed = subprocess.run(
+            [
+                "bash",
+                "-c",
+                _EVALUATOR_TOOLCHAIN_PROBE,
+                "grhsim-evaluator-toolchain-preflight",
+                str(target_env),
+            ],
+            check=False,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=60.0,
+        )
+    except (OSError, subprocess.SubprocessError) as error:
+        raise SystemExit(
+            "GrhSIM evaluator toolchain preflight could not inspect the target environment"
+        ) from error
+
+    fields: dict[str, str] = {}
+    for line in completed.stdout.splitlines():
+        name, separator, value = line.partition("=")
+        if separator and name in {
+            "compiler",
+            "compiler_major",
+            "scanner",
+            "scanner_major",
+        }:
+            fields[name] = value
+    compiler_major = fields.get("compiler_major")
+    if completed.returncode != 0:
+        if completed.returncode == 20:
+            detail = "clang++ is missing or not executable"
+        elif completed.returncode == 21:
+            detail = "cannot determine the clang++ major version"
+        elif completed.returncode == 22 and compiler_major is not None:
+            detail = (
+                f"no clang-scan-deps matching clang {compiler_major}; "
+                f"install clang-tools-{compiler_major}"
+            )
+        else:
+            detail = "target env.sh or compiler probe failed"
+        raise SystemExit(f"GrhSIM evaluator toolchain preflight failed: {detail}")
+
+    required = {"compiler", "compiler_major", "scanner", "scanner_major"}
+    if set(fields) != required or fields["compiler_major"] != fields["scanner_major"]:
+        raise SystemExit(
+            "GrhSIM evaluator toolchain preflight returned an inconsistent toolchain"
+        )
+    print(
+        "GrhSIM evaluator toolchain preflight passed: "
+        f"compiler={fields['compiler']}, scanner={fields['scanner']}, "
+        f"major={fields['compiler_major']}"
+    )
+    return 0
 
 
 def _launch_guard_digest(
@@ -1063,6 +1165,7 @@ def main() -> int:
         print(shlex.join(command))
         return 0
     launch_guard = _launch_guard_digest(args, command)
+    run_evaluator_toolchain_preflight(args)
     run_codex_preflight(args)
     if not secrets.compare_digest(
         launch_guard, _launch_guard_digest(args, command)

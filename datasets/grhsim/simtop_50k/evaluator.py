@@ -2001,6 +2001,7 @@ def _run_runtime_with_retries(
         0, int(os.environ.get("GRHSIM_INFRA_RETRIES", DEFAULT_INFRA_RETRIES))
     ) + 1
     result: dict[str, Any] = {}
+    retry_history: list[dict[str, Any]] = []
     for attempt in range(1, attempts + 1):
         result = _runtime_result_to_dict(
             runtime_callable(
@@ -2014,8 +2015,34 @@ def _run_runtime_with_retries(
         retryable = bool(
             result.get("infrastructure_retry") or result.get("retryable_infra")
         )
+        if retryable:
+            raw_error = result.get("error")
+            error = (
+                str(raw_error)
+                if raw_error is not None
+                else "retryable runtime infrastructure outcome"
+            )
+            retry_history.append(
+                {
+                    "attempt": attempt,
+                    "error": scrub_secrets(error),
+                    "diagnostics": scrub_secrets(result.get("diagnostics", {})),
+                }
+            )
         if not retryable or attempt == attempts:
             break
+    if retry_history:
+        final_diagnostics = result.get("diagnostics")
+        merged_diagnostics = (
+            dict(final_diagnostics) if isinstance(final_diagnostics, Mapping) else {}
+        )
+        merged_diagnostics["runtime_retry_attempts"] = retry_history
+        result["diagnostics"] = merged_diagnostics
+        if bool(result.get("infrastructure_retry") or result.get("retryable_infra")):
+            result["retry_diagnostic"] = "; ".join(
+                f"runtime attempt {item['attempt']}/{attempts}: {item['error']}"
+                for item in retry_history
+            )
     return result
 
 
@@ -2121,6 +2148,12 @@ def score_runtime_result(result: Mapping[str, Any]) -> dict[str, Any]:
         error = scrub_secrets(
             result.get("error", "retryable infrastructure failure")
         )
+        raw_retry_diagnostic = result.get("retry_diagnostic")
+        retry_diagnostic = (
+            scrub_secrets(raw_retry_diagnostic)
+            if isinstance(raw_retry_diagnostic, str) and raw_retry_diagnostic
+            else error
+        )
         return {
             "combined_score": 0.0,
             "validity": 0.0,
@@ -2129,7 +2162,7 @@ def score_runtime_result(result: Mapping[str, Any]) -> dict[str, Any]:
             "retryable_infra": 1.0,
             "retry_after_s": 30.0,
             "error": error,
-            "retry_diagnostic": error,
+            "retry_diagnostic": retry_diagnostic,
             "diagnostics": scrub_secrets(result.get("diagnostics", {})),
         }
     if not valid:

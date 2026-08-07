@@ -20,6 +20,7 @@ import re
 import shutil
 import signal
 import statistics
+import struct
 import subprocess
 import tempfile
 import time
@@ -208,6 +209,8 @@ class RuntimeConfig:
     min_task_clock_scheduled_percent: float = 99.9
     min_cpus_utilized: float = 0.995
     max_context_switches_per_second: float = 20.0
+    # This is the control/reference minimum. Variants retain the same minimum
+    # coverage after scaling by their ELF PT_LOAD file-backed footprint.
     min_binary_pages: int = 20_000
     min_binary_local_ratio: float = 0.999
     min_nemu_pages: int = 100
@@ -709,6 +712,124 @@ def parse_numa_maps_file_pages(
     return requested
 
 
+def elf_loadable_file_pages(
+    path: str | Path, *, page_size: int | None = None
+) -> int:
+    """Return the unique file-offset pages covered by ELF ``PT_LOAD`` entries."""
+
+    binary = Path(path)
+    resolved_page_size = (
+        int(os.sysconf("SC_PAGE_SIZE")) if page_size is None else int(page_size)
+    )
+    if resolved_page_size <= 0:
+        raise ValueError(f"invalid page size: {resolved_page_size}")
+
+    file_size = binary.stat().st_size
+    with binary.open("rb") as stream:
+        header = stream.read(64)
+        if len(header) < 16 or header[:4] != b"\x7fELF":
+            raise ValueError(f"not an ELF file: {binary}")
+        elf_class = header[4]
+        elf_data = header[5]
+        if elf_data == 1:
+            endian = "<"
+        elif elf_data == 2:
+            endian = ">"
+        else:
+            raise ValueError(f"unsupported ELF data encoding {elf_data}: {binary}")
+
+        if elf_class == 2:
+            header_size = 64
+            program_header_size = 56
+            if len(header) < header_size:
+                raise ValueError(f"truncated ELF header: {binary}")
+            program_offset = struct.unpack_from(f"{endian}Q", header, 32)[0]
+            entry_size = struct.unpack_from(f"{endian}H", header, 54)[0]
+            entry_count = struct.unpack_from(f"{endian}H", header, 56)[0]
+            offset_field = (8, "Q")
+            file_size_field = (32, "Q")
+        elif elf_class == 1:
+            header_size = 52
+            program_header_size = 32
+            if len(header) < header_size:
+                raise ValueError(f"truncated ELF header: {binary}")
+            program_offset = struct.unpack_from(f"{endian}I", header, 28)[0]
+            entry_size = struct.unpack_from(f"{endian}H", header, 42)[0]
+            entry_count = struct.unpack_from(f"{endian}H", header, 44)[0]
+            offset_field = (4, "I")
+            file_size_field = (16, "I")
+        else:
+            raise ValueError(f"unsupported ELF class {elf_class}: {binary}")
+
+        if entry_count in (0, 0xFFFF):
+            raise ValueError(f"unsupported ELF program-header count {entry_count}: {binary}")
+        if entry_size < program_header_size:
+            raise ValueError(
+                f"ELF program-header entry is too small ({entry_size}): {binary}"
+            )
+        table_size = entry_size * entry_count
+        if program_offset > file_size or table_size > file_size - program_offset:
+            raise ValueError(f"ELF program-header table is out of bounds: {binary}")
+
+        intervals: list[tuple[int, int]] = []
+        for index in range(entry_count):
+            stream.seek(program_offset + index * entry_size)
+            entry = stream.read(program_header_size)
+            if len(entry) != program_header_size:
+                raise ValueError(f"truncated ELF program-header table: {binary}")
+            program_type = struct.unpack_from(f"{endian}I", entry, 0)[0]
+            if program_type != 1:  # PT_LOAD
+                continue
+            file_offset = struct.unpack_from(
+                f"{endian}{offset_field[1]}", entry, offset_field[0]
+            )[0]
+            load_file_size = struct.unpack_from(
+                f"{endian}{file_size_field[1]}", entry, file_size_field[0]
+            )[0]
+            if load_file_size == 0:
+                continue
+            if file_offset > file_size or load_file_size > file_size - file_offset:
+                raise ValueError(f"ELF PT_LOAD file range is out of bounds: {binary}")
+            first_page = file_offset // resolved_page_size
+            last_page = (
+                file_offset + load_file_size + resolved_page_size - 1
+            ) // resolved_page_size
+            intervals.append((first_page, last_page))
+
+    if not intervals:
+        raise ValueError(f"ELF has no file-backed PT_LOAD pages: {binary}")
+    total = 0
+    current_first, current_last = sorted(intervals)[0]
+    for first, last in sorted(intervals)[1:]:
+        if first <= current_last:
+            current_last = max(current_last, last)
+            continue
+        total += current_last - current_first
+        current_first, current_last = first, last
+    return total + current_last - current_first
+
+
+def scale_binary_minimum_pages(
+    configured_reference_min_pages: int,
+    binary_loadable_pages: int,
+    reference_loadable_pages: int,
+) -> int:
+    """Scale a reference minimum so variants must meet equal ELF coverage."""
+
+    if configured_reference_min_pages < 0:
+        raise ValueError("configured reference minimum pages must be non-negative")
+    if binary_loadable_pages <= 0 or reference_loadable_pages <= 0:
+        raise ValueError("ELF loadable page counts must be positive")
+    effective_reference_minimum = min(
+        configured_reference_min_pages, reference_loadable_pages
+    )
+    numerator = effective_reference_minimum * binary_loadable_pages
+    return min(
+        binary_loadable_pages,
+        (numerator + reference_loadable_pages - 1) // reference_loadable_pages,
+    )
+
+
 def audit_numa_maps(
     numa_maps_text: str,
     *,
@@ -1038,6 +1159,8 @@ class GrhSimRuntime:
         self._environment: dict[str, str] | None = None
         self._placement: Placement | None = None
         self._topology: tuple[CpuTopology, ...] = ()
+        self._binary_reference: Path | None = None
+        self._loadable_page_cache: dict[Path, int] = {}
 
     def evaluate(
         self,
@@ -1345,6 +1468,34 @@ class GrhSimRuntime:
             except subprocess.TimeoutExpired:
                 pass
 
+    def _loadable_file_pages(self, binary: Path) -> int:
+        resolved = binary.resolve()
+        cached = self._loadable_page_cache.get(resolved)
+        if cached is None:
+            cached = elf_loadable_file_pages(resolved)
+            self._loadable_page_cache[resolved] = cached
+        return cached
+
+    def _binary_page_policy(self, binary: Path) -> tuple[int, dict[str, Any]]:
+        reference = self._binary_reference or binary
+        binary_pages = self._loadable_file_pages(binary)
+        reference_pages = self._loadable_file_pages(reference)
+        effective_reference_minimum = min(
+            self.config.min_binary_pages, reference_pages
+        )
+        scaled_minimum = scale_binary_minimum_pages(
+            self.config.min_binary_pages, binary_pages, reference_pages
+        )
+        return scaled_minimum, {
+            "mode": "reference-elf-pt-load-coverage",
+            "configured_reference_min_pages": self.config.min_binary_pages,
+            "effective_reference_min_pages": effective_reference_minimum,
+            "reference_loadable_file_pages": reference_pages,
+            "binary_loadable_file_pages": binary_pages,
+            "minimum_coverage": effective_reference_minimum / reference_pages,
+            "scaled_min_pages": scaled_minimum,
+        }
+
     def _run_one(
         self,
         artifacts: ArtifactSet,
@@ -1354,6 +1505,9 @@ class GrhSimRuntime:
         role: str,
         index: int,
     ) -> dict[str, Any]:
+        min_binary_pages, binary_page_policy = self._binary_page_policy(
+            artifacts.binary
+        )
         staged, stage_root, manifest = self._stage_artifacts(artifacts, placement, environment)
         results_root = self.config.results_dir or Path(tempfile.gettempdir()) / "simtop_50k_results"
         results_root.mkdir(parents=True, exist_ok=True)
@@ -1456,11 +1610,12 @@ class GrhSimRuntime:
                     binary=staged.binary,
                     nemu=staged.nemu,
                     target_node=placement.ccd.numa_node,
-                    min_binary_pages=self.config.min_binary_pages,
+                    min_binary_pages=min_binary_pages,
                     min_binary_local_ratio=self.config.min_binary_local_ratio,
                     min_nemu_pages=self.config.min_nemu_pages,
                     min_nemu_local_ratio=self.config.min_nemu_local_ratio,
                 )
+                numa_audit["binary"]["min_pages_policy"] = binary_page_policy
                 audit_path.write_text(
                     f"process={process_audit!r}\nnuma={numa_audit!r}\n",
                     encoding="utf-8",
@@ -1567,6 +1722,11 @@ class GrhSimRuntime:
         candidate_artifacts = resolve_artifacts(candidate, self.config, role="candidate")
         control_artifacts = (
             resolve_artifacts(control, self.config, role="control") if control is not None else None
+        )
+        self._binary_reference = (
+            control_artifacts.binary
+            if control_artifacts is not None
+            else candidate_artifacts.binary
         )
         placement = self._select_fixed_placement(environment)
         original_affinity = self._pin_runner(placement.helper_cpu)
@@ -1681,6 +1841,7 @@ __all__ = [
     "build_source_env_command",
     "build_workload_command",
     "discover_cpu_topology",
+    "elf_loadable_file_pages",
     "enumerate_ccds",
     "evaluate_candidate",
     "format_cpu_list",
@@ -1691,6 +1852,7 @@ __all__ = [
     "parse_numa_maps_file_pages",
     "parse_perf_stat_csv",
     "resolve_artifacts",
+    "scale_binary_minimum_pages",
     "select_helper_cpu",
     "select_placement",
 ]

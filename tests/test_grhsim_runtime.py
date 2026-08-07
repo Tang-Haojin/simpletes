@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import subprocess
+import struct
 from pathlib import Path
 
 import pytest
@@ -28,11 +29,13 @@ from datasets.grhsim.simtop_50k.runtime import (
     build_source_env_command,
     build_workload_command,
     discover_cpu_topology,
+    elf_loadable_file_pages,
     enumerate_ccds,
     format_cpu_list,
     parse_cpu_list,
     parse_mpstat_idle,
     resolve_artifacts,
+    scale_binary_minimum_pages,
     select_helper_cpu,
     select_placement,
 )
@@ -89,6 +92,49 @@ def _valid_perf() -> str:
             "0,,cpu-migrations,74215055852,100.00,0.000,/sec",
         )
     )
+
+
+def _write_test_elf64(path: Path, segments: tuple[tuple[int, int], ...]) -> None:
+    ident = b"\x7fELF" + bytes((2, 1, 1, 0)) + bytes(8)
+    header = struct.pack(
+        "<16sHHIQQQIHHHHHH",
+        ident,
+        2,
+        62,
+        1,
+        0,
+        64,
+        0,
+        0,
+        64,
+        56,
+        len(segments),
+        0,
+        0,
+        0,
+    )
+    program_headers = b"".join(
+        struct.pack(
+            "<IIQQQQQQ",
+            1,
+            5,
+            offset,
+            offset,
+            offset,
+            file_size,
+            file_size,
+            4096,
+        )
+        for offset, file_size in segments
+    )
+    image_size = max(
+        len(header) + len(program_headers),
+        *(offset + file_size for offset, file_size in segments),
+    )
+    image = bytearray(image_size)
+    image[: len(header)] = header
+    image[64 : 64 + len(program_headers)] = program_headers
+    path.write_bytes(image)
 
 
 def test_cpu_list_round_trip_and_rejects_invalid_range():
@@ -296,6 +342,73 @@ def test_numa_maps_requires_binary_and_nemu_page_locality():
 
     remote = text.replace("N0=190 N1=10", "N0=189 N1=11")
     assert not audit_numa_maps(remote, binary=binary, nemu=nemu, target_node=0)[0]
+
+
+def test_elf_loadable_pages_unions_overlapping_file_ranges(tmp_path: Path):
+    binary = tmp_path / "emu"
+    _write_test_elf64(
+        binary,
+        (
+            (0x0000, 0x1800),
+            (0x1000, 0x2000),
+            (0x5000, 0x0100),
+        ),
+    )
+
+    assert elf_loadable_file_pages(binary, page_size=4096) == 4
+
+
+def test_scaled_binary_page_gate_accepts_smaller_fully_local_elf():
+    control_loadable_pages = 22_296
+    candidate_loadable_pages = 21_350
+    scaled_minimum = scale_binary_minimum_pages(
+        20_000, candidate_loadable_pages, control_loadable_pages
+    )
+    binary = Path("/dev/shm/run/emu")
+    nemu = Path("/dev/shm/run/nemu.so")
+    fully_local = "\n".join(
+        (
+            f"00400000 default file={binary} mapped=19877 N0=19877",
+            f"7f000000 default file={nemu} mapped=115 N0=115",
+        )
+    )
+
+    assert scaled_minimum == 19_152
+    assert not audit_numa_maps(
+        fully_local, binary=binary, nemu=nemu, target_node=0
+    )[0]
+    passed, diagnostics = audit_numa_maps(
+        fully_local,
+        binary=binary,
+        nemu=nemu,
+        target_node=0,
+        min_binary_pages=scaled_minimum,
+    )
+    assert passed
+    assert diagnostics["binary"]["min_pages"] == scaled_minimum
+    assert diagnostics["binary"]["local_ratio"] == 1.0
+
+    undercovered = fully_local.replace(
+        "mapped=19877 N0=19877",
+        f"mapped={scaled_minimum - 1} N0={scaled_minimum - 1}",
+    )
+    assert not audit_numa_maps(
+        undercovered,
+        binary=binary,
+        nemu=nemu,
+        target_node=0,
+        min_binary_pages=scaled_minimum,
+    )[0]
+    remotely_placed = fully_local.replace(
+        "mapped=19877 N0=19877", "mapped=19877 N0=19850 N1=27"
+    )
+    assert not audit_numa_maps(
+        remotely_placed,
+        binary=binary,
+        nemu=nemu,
+        target_node=0,
+        min_binary_pages=scaled_minimum,
+    )[0]
 
 
 def test_perf_audit_requires_pmu_schedule_task_clock_context_and_zero_migration():

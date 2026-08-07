@@ -1864,6 +1864,11 @@ def test_evaluate_retries_infrastructure_without_counting_candidate(monkeypatch,
     monkeypatch.setattr(evaluator, "acquire_slot", fake_slot)
     monkeypatch.setenv("GRHSIM_INFRA_RETRIES", "2")
     calls = 0
+    errors = (
+        "NUMA file-page locality audit failed",
+        "external load prevented the fixed CCD pre-gate",
+        "NUMA file-page locality audit failed",
+    )
 
     def retry(*_args, **_kwargs):
         nonlocal calls
@@ -1872,7 +1877,8 @@ def test_evaluate_retries_infrastructure_without_counting_candidate(monkeypatch,
             "valid": False,
             "infrastructure_retry": True,
             "retryable_infra": True,
-            "diagnostics": {"gate": "busy CCD"},
+            "error": errors[calls - 1],
+            "diagnostics": {"gate": f"attempt-{calls}"},
         }
 
     metrics = evaluator.evaluate(
@@ -1885,6 +1891,15 @@ def test_evaluate_retries_infrastructure_without_counting_candidate(monkeypatch,
     assert metrics["infrastructure_retry"] == 1
     assert metrics["retryable_infra"] == 1
     assert metrics["valid_candidate"] == 0
+    history = metrics["diagnostics"]["runtime_retry_attempts"]
+    assert [item["attempt"] for item in history] == [1, 2, 3]
+    assert [item["error"] for item in history] == list(errors)
+    assert history[0]["diagnostics"] == {"gate": "attempt-1"}
+    assert metrics["retry_diagnostic"] == (
+        "runtime attempt 1/3: NUMA file-page locality audit failed; "
+        "runtime attempt 2/3: external load prevented the fixed CCD pre-gate; "
+        "runtime attempt 3/3: NUMA file-page locality audit failed"
+    )
 
 
 def test_candidate_build_failure_is_not_retryable(monkeypatch, tmp_path: Path):

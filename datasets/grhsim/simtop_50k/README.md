@@ -3,13 +3,13 @@
 This bench evolves a schema-v2 structured JSON candidate whose payload is a
 safe unified diff against the pinned `wolvrix` revision and whose
 `candidate_mode` declares its attribution path. The evaluator never edits the
-user checkout: it creates a locked local clone, verifies parent `52ba7d9` and
-`wolvrix` `d3ed9de`, applies the patch only inside that slot, runs the
+user checkout: it creates a locked local clone, verifies parent `b2fd50a` and
+`wolvrix` `79ec203`, applies the patch only inside that slot, runs the
 mode-specific generated-source attribution gates, builds a real local ELF,
 runs fixed-ASLR function gates, and hands resolved artifacts to the trusted
 runtime.
 
-This pin pair is the fresh post-principled-hot-event control namespace. Native
+This pin pair is the fresh post-typed-state control namespace. Native
 defaults already contain R (cold register-write guard admission/group hints), W (singleton
 memory-write hints only inside an R-admitted run), and A (eligible adjacent
 SystemTask/`xs_assert_v2` outer-guard nesting). They also contain cold
@@ -22,8 +22,13 @@ event from reusable exact-posedge demand above a fixed cost, remaps it to typed
 slot zero, predecodes exact posedge as a bool, and snapshots that bool per
 covered batch while retaining enum handling for residual queries. Its gate does
 not inspect port names, benchmark identity, ValueId, or a raw slot-count
-threshold. None of these landed or closed directions—including HS/TRBS under a
-new name—may be reproposed.
+threshold. Typed-state storage is also already native-default: persistent state
+uses field-sensitive typed storage, persistent-state bool slots use native
+`bool`, and materialized value-bucket bool slots use native `bool`. These are
+three incremental mechanisms represented by four ablation nodes `B`, `S8`, `SB`,
+and `SBV`; do not count the nodes as four optimizations or repropose them. None
+of these landed or closed directions—including HS/TRBS under a new name—may be
+reproposed.
 
 The score is `control_mean_walltime_ms / candidate_mean_walltime_ms`. Absolute
 control and candidate `Host time spent` values and their millisecond/percentage
@@ -32,7 +37,7 @@ data are diagnostics, not substitute objectives. Retryable host-load or audit
 failures are retried as the same candidate and do not count toward the valid
 candidate budget.
 
-## Start fresh, then continue only within the post-principled-hot-event pins
+## Start fresh, then continue only within the post-typed-state pins
 
 The launcher fixes the requested model to Codex-compatible `k3` with reasoning
 effort `ultra`, uses four RPUCG chains with `k=1`, runs four generation workers
@@ -51,7 +56,7 @@ API key is retained by a per-attempt loopback compatibility proxy for the active
 generated tool shells inherit neither credential nor unrelated parent secrets.
 Secrets are not placed in argv, logs, metrics, or checkpoints.
 
-The first run after this repin must use the checked-in empty control seed shown
+The first run after this repin must use the checked-in typed-state empty control seed shown
 below. It creates a new pin-derived evaluator slot namespace and a fresh
 checkpoint instance. Do not migrate, copy, resume, or seed from the old
 `de37459`/`fd12d83`, `d31118b`/`16a9f49`, or `fbe4e1c`/`8f6ba14` namespaces;
@@ -133,10 +138,10 @@ seeding.
 
 ```bash
 ./.venv/bin/python datasets/grhsim/simtop_50k/launcher.py \
-  --resume checkpoints/grhsim_simtop_50k/<post-principled-hot-event-run>/<date>/instance-<id>
+  --resume checkpoints/grhsim_simtop_50k/<post-typed-state-run>/<date>/instance-<id>
 ```
 
-An exhausted post-principled-hot-event checkpoint may be extended in place only
+An exhausted post-typed-state checkpoint may be extended in place only
 with the explicit `--extend-resume-budget` opt-in. Both limits are absolute totals, not
 increments. The engine preserves the existing nodes, scores, attempt/valid
 counters, per-chain prompt counts, histories, and failure records; it
@@ -150,7 +155,7 @@ the same cumulative target of `32` valid candidates:
 ```bash
 GRHSIM_INFRA_RETRIES=8 \
 ./.venv/bin/python datasets/grhsim/simtop_50k/launcher.py \
-  --resume checkpoints/grhsim_simtop_50k/<post-principled-hot-event-run>/<date>/instance-<id>/db_state_<time> \
+  --resume checkpoints/grhsim_simtop_50k/<post-typed-state-run>/<date>/instance-<id>/db_state_<time> \
   --extend-resume-budget \
   --max-proposals 192 \
   --valid-target 32
@@ -162,13 +167,13 @@ tree and counters:
 
 ```bash
 ./.venv/bin/python datasets/grhsim/simtop_50k/launcher.py \
-  --init-program checkpoints/grhsim_simtop_50k/<post-principled-hot-event-run>/<date>/instance-<id>/db_state_<time>/best_program.txt
+  --init-program checkpoints/grhsim_simtop_50k/<post-typed-state-run>/<date>/instance-<id>/db_state_<time>/best_program.txt
 ```
 
 The seed must be a regular, non-symlink file containing a complete marked
 schema-v2 candidate document. A checkpoint `best_program.txt` seed must also
 match a sibling node whose recorded parent/wolvrix pins equal this evaluator's
-new `52ba7d9`/`d3ed9de` pins. It is evaluated again as the new instance's
+new `b2fd50a`/`79ec203` pins. It is evaluated again as the new instance's
 initial node; that initial evaluation does not consume a proposal or
 valid-candidate slot.
 Omit `--resume` for this continuation so the launcher creates a fresh checkpoint
@@ -183,7 +188,7 @@ the proposal budget. For example, a doubled fresh search uses:
 ```bash
 GRHSIM_INFRA_RETRIES=4 \
 ./.venv/bin/python datasets/grhsim/simtop_50k/launcher.py \
-  --init-program checkpoints/grhsim_simtop_50k/<post-principled-hot-event-run>/<date>/instance-<id>/db_state_<time>/best_program.txt \
+  --init-program checkpoints/grhsim_simtop_50k/<post-typed-state-run>/<date>/instance-<id>/db_state_<time>/best_program.txt \
   --max-proposals 32 \
   --valid-target 16 \
   --llm-timeout 10800 \

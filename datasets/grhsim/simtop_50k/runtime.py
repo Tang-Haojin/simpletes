@@ -31,6 +31,15 @@ from typing import Any, Callable, Iterable, Mapping, Sequence
 
 
 EXPECTED_PERSONALITY = "00040000"
+DEFAULT_MIN_BINARY_PAGES = 20_000
+# The original SimTop-50k control ELF had 22,260 unique file-backed
+# PT_LOAD pages. Keep the resulting dimensionless warm-up requirement fixed
+# when a later research run repins its control to a smaller best-known binary;
+# deriving it from that new control would move the gate.
+DEFAULT_REFERENCE_LOADABLE_FILE_PAGES = 22_260
+DEFAULT_MIN_BINARY_COVERAGE = (
+    DEFAULT_MIN_BINARY_PAGES / DEFAULT_REFERENCE_LOADABLE_FILE_PAGES
+)
 DEFAULT_PERF_EVENTS = (
     "cycles:u",
     "instructions:u",
@@ -209,14 +218,26 @@ class RuntimeConfig:
     min_task_clock_scheduled_percent: float = 99.9
     min_cpus_utilized: float = 0.995
     max_context_switches_per_second: float = 20.0
-    # This is the control/reference minimum. Variants retain the same minimum
-    # coverage after scaling by their ELF PT_LOAD file-backed footprint.
-    min_binary_pages: int = 20_000
+    # Kept for compatibility with the original absolute gate and diagnostics.
+    # The runtime gate itself uses the fixed, dimensionless coverage below; it
+    # must not be recomputed from the current control artifact.
+    min_binary_pages: int = DEFAULT_MIN_BINARY_PAGES
+    min_binary_coverage: float | None = None
     min_binary_local_ratio: float = 0.999
     min_nemu_pages: int = 100
     min_nemu_local_ratio: float = 0.95
     keep_staged: bool = False
     env_overrides: Mapping[str, str] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if self.min_binary_coverage is None:
+            # Preserve callers that still customize the legacy absolute
+            # reference minimum, but anchor it to the fixed protocol ELF,
+            # never to the current control artifact.
+            self.min_binary_coverage = min(
+                1.0,
+                float(self.min_binary_pages) / DEFAULT_REFERENCE_LOADABLE_FILE_PAGES,
+            )
 
     @classmethod
     def from_mapping(cls, value: Mapping[str, Any] | "RuntimeConfig" | None) -> "RuntimeConfig":
@@ -828,6 +849,28 @@ def scale_binary_minimum_pages(
         binary_loadable_pages,
         (numerator + reference_loadable_pages - 1) // reference_loadable_pages,
     )
+
+
+def minimum_pages_for_coverage(
+    minimum_coverage: float, binary_loadable_pages: int
+) -> int:
+    """Return the smallest resident-page count meeting fixed ELF coverage.
+
+    Unlike :func:`scale_binary_minimum_pages`, this helper has no active
+    control/reference argument. That distinction is intentional: a future
+    run may use its latest best binary as control, but doing so must not alter
+    the benchmark's warm-up requirement.
+    """
+
+    try:
+        coverage = float(minimum_coverage)
+    except (TypeError, ValueError) as error:
+        raise ValueError("minimum ELF coverage must be a finite number") from error
+    if not math.isfinite(coverage) or coverage <= 0.0 or coverage > 1.0:
+        raise ValueError("minimum ELF coverage must be in the interval (0, 1]")
+    if binary_loadable_pages <= 0:
+        raise ValueError("ELF loadable page count must be positive")
+    return min(binary_loadable_pages, math.ceil(coverage * binary_loadable_pages))
 
 
 def audit_numa_maps(
@@ -1477,22 +1520,28 @@ class GrhSimRuntime:
         return cached
 
     def _binary_page_policy(self, binary: Path) -> tuple[int, dict[str, Any]]:
-        reference = self._binary_reference or binary
         binary_pages = self._loadable_file_pages(binary)
-        reference_pages = self._loadable_file_pages(reference)
-        effective_reference_minimum = min(
-            self.config.min_binary_pages, reference_pages
-        )
-        scaled_minimum = scale_binary_minimum_pages(
-            self.config.min_binary_pages, binary_pages, reference_pages
+        # The active control is retained only as an audit breadcrumb. It is
+        # deliberately excluded from the threshold calculation so repinning
+        # the next run to a newly found best cannot silently change the gate.
+        reference_pages: int | None = None
+        reference = self._binary_reference
+        if reference is not None:
+            # Keep malformed/missing artifacts fail-closed. The reference is
+            # diagnostic-only for the threshold, but it is still an artifact
+            # that the evaluator promised to validate.
+            reference_pages = self._loadable_file_pages(reference)
+        scaled_minimum = minimum_pages_for_coverage(
+            self.config.min_binary_coverage, binary_pages
         )
         return scaled_minimum, {
-            "mode": "reference-elf-pt-load-coverage",
+            "mode": "fixed-elf-pt-load-coverage",
+            "coverage_source": "benchmark-protocol-constant",
             "configured_reference_min_pages": self.config.min_binary_pages,
-            "effective_reference_min_pages": effective_reference_minimum,
+            "configured_reference_loadable_file_pages": DEFAULT_REFERENCE_LOADABLE_FILE_PAGES,
             "reference_loadable_file_pages": reference_pages,
             "binary_loadable_file_pages": binary_pages,
-            "minimum_coverage": effective_reference_minimum / reference_pages,
+            "minimum_coverage": self.config.min_binary_coverage,
             "scaled_min_pages": scaled_minimum,
         }
 
@@ -1817,8 +1866,11 @@ __all__ = [
     "ArtifactSet",
     "CcdTopology",
     "CpuTopology",
+    "DEFAULT_MIN_BINARY_COVERAGE",
+    "DEFAULT_MIN_BINARY_PAGES",
     "DEFAULT_PERF_EVENTS",
     "DEFAULT_PMU_EVENTS",
+    "DEFAULT_REFERENCE_LOADABLE_FILE_PAGES",
     "EXPECTED_PERSONALITY",
     "GateAssessment",
     "GrhSimRuntime",
@@ -1846,6 +1898,7 @@ __all__ = [
     "evaluate_candidate",
     "format_cpu_list",
     "load_sourced_environment",
+    "minimum_pages_for_coverage",
     "parse_cpu_list",
     "parse_cpus_allowed_list",
     "parse_mpstat_idle",

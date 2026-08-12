@@ -10,6 +10,8 @@ from datasets.grhsim.simtop_50k.runtime import (
     ArtifactSet,
     CcdTopology,
     CpuTopology,
+    DEFAULT_MIN_BINARY_COVERAGE,
+    DEFAULT_REFERENCE_LOADABLE_FILE_PAGES,
     GateAssessment,
     GrhSimRuntime,
     InvalidCandidateError,
@@ -32,6 +34,7 @@ from datasets.grhsim.simtop_50k.runtime import (
     elf_loadable_file_pages,
     enumerate_ccds,
     format_cpu_list,
+    minimum_pages_for_coverage,
     parse_cpu_list,
     parse_mpstat_idle,
     resolve_artifacts,
@@ -409,6 +412,48 @@ def test_scaled_binary_page_gate_accepts_smaller_fully_local_elf():
         target_node=0,
         min_binary_pages=scaled_minimum,
     )[0]
+
+
+def test_fixed_binary_coverage_is_independent_of_repinned_control():
+    assert DEFAULT_REFERENCE_LOADABLE_FILE_PAGES == 22_260
+    assert DEFAULT_MIN_BINARY_COVERAGE == pytest.approx(20_000 / 22_260)
+    # Both the c333 intermediate and the final best remain below the fixed
+    # protocol threshold's resident-page requirement when fully local.
+    assert minimum_pages_for_coverage(DEFAULT_MIN_BINARY_COVERAGE, 21_314) == 19_151
+    assert minimum_pages_for_coverage(DEFAULT_MIN_BINARY_COVERAGE, 20_401) == 18_330
+
+    runtime = GrhSimRuntime(RuntimeConfig())
+    page_counts = {
+        Path("candidate"): 20_401,
+        Path("old-control"): 22_260,
+        Path("new-control"): 20_401,
+    }
+    runtime._loadable_file_pages = lambda path: page_counts[Path(path)]
+    runtime._binary_reference = Path("old-control")
+    old_threshold, old_policy = runtime._binary_page_policy(Path("candidate"))
+    runtime._binary_reference = Path("new-control")
+    new_threshold, new_policy = runtime._binary_page_policy(Path("candidate"))
+
+    assert old_threshold == new_threshold == 18_330
+    assert old_policy["minimum_coverage"] == new_policy["minimum_coverage"]
+    assert old_policy["mode"] == "fixed-elf-pt-load-coverage"
+    assert old_policy["reference_loadable_file_pages"] == 22_260
+    assert new_policy["reference_loadable_file_pages"] == 20_401
+
+
+@pytest.mark.parametrize("coverage", [0.0, -0.1, 1.000001, float("nan"), float("inf")])
+def test_fixed_binary_coverage_rejects_invalid_values(coverage: float):
+    with pytest.raises(ValueError, match="minimum ELF coverage"):
+        minimum_pages_for_coverage(coverage, 10)
+
+
+def test_legacy_minimum_override_is_anchored_to_protocol_footprint():
+    config = RuntimeConfig(min_binary_pages=19_000)
+    assert config.min_binary_coverage == pytest.approx(19_000 / 22_260)
+    runtime = GrhSimRuntime(config)
+    runtime._loadable_file_pages = lambda _path: 20_401
+    threshold, _policy = runtime._binary_page_policy(Path("candidate"))
+    assert threshold == 17_414
 
 
 def test_perf_audit_requires_pmu_schedule_task_clock_context_and_zero_migration():

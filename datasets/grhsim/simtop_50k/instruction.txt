@@ -19,9 +19,9 @@ walltime. Cycles, instructions, generated-source size, ELF sections, BAE, DAG
 edges, PMU counters, and profiles are diagnostic evidence only. A change is
 useful only if the fixed-ASLR, functionally equivalent end-to-end run improves.
 
-This is the fresh post-principled-hot-event baseline at parent
-`52ba7d9edcd713cd0ee3d8a605f1d4aa31b3c730` and Wolvrix
-`d3ed9dea975bddf01185dde5c548a69241a09de9`. R (cold register-guard
+This is the fresh post-typed-state baseline at parent
+`b2fd50a4cac034cea8420835c6869d05cdde670c` and Wolvrix
+`79ec2037b00f2d4894d72785277ebe3f5d37782d`. R (cold register-guard
 admission and group hints), W (singleton MemoryWritePort hints inside an
 R-admitted run), and A (adjacent SystemTask plus `xs_assert_v2` outer-guard
 nesting) are already native-default behavior. Do not propose, reconstruct, or
@@ -37,7 +37,12 @@ demand above a fixed materialize-and-clear cost, remaps it to typed slot zero,
 predecodes exact posedge as a bool, and snapshots that bool per covered batch;
 residual negedge/general queries retain enum handling. Its selector uses no port
 name, SimTop/benchmark identity, ValueId, or raw event-slot-count threshold.
-Do not reconstruct HS, TRBS, or a renamed equivalent of this same mechanism.
+Native typed-state storage is also already default: persistent state is laid out by
+field/type, persistent-state bool slots use native `bool`, and materialized value
+bucket bool slots use native `bool`. These are three incremental mechanisms with
+four ablation nodes (`B`, `S8`, `SB`, `SBV`); do not repropose them, count the nodes
+as four optimizations, or match SimTop names. Do not reconstruct HS, TRBS, or a
+renamed equivalent of this same mechanism.
 Research a distinct mechanism.
 
 Return exactly one JSON object matching `candidate.schema.json`. The backend
@@ -50,7 +55,7 @@ will place it between the EVOLVE-BLOCK markers. Its fields mean:
 - `evidence`: repository paths plus absolute observed counts/timings/profile
   facts that motivated this candidate. Never invent measurements.
 - `patch`: a complete `git diff`-style unified diff relative to
-  `wolvrix@d3ed9dea975bddf01185dde5c548a69241a09de9`. It must end with a
+  `wolvrix@79ec2037b00f2d4894d72785277ebe3f5d37782d`. It must end with a
   newline.
 - `enable_options`: an array of `{ "name": snake_case, "value": ... }` entries.
   It must be empty for `default-path` and non-empty for `explicit-options`.

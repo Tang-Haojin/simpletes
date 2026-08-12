@@ -263,10 +263,10 @@ def test_seed_and_schema_are_valid_and_pinned():
         "WOLVRIX_XS_GRHSIM_COMMIT_EXACT_EVENT_POLICY": "targeted-cold-layout"
     }
     assert evaluator.PINNED_PARENT_COMMIT == (
-        "52ba7d9edcd713cd0ee3d8a605f1d4aa31b3c730"
+        "b2fd50a4cac034cea8420835c6869d05cdde670c"
     )
     assert evaluator.PINNED_WOLVRIX_COMMIT == (
-        "d3ed9dea975bddf01185dde5c548a69241a09de9"
+        "79ec2037b00f2d4894d72785277ebe3f5d37782d"
     )
     assert evaluator.PINNED_PARENT_COMMIT != OLD_PRE_RWA_PARENT_COMMIT
     assert evaluator.PINNED_WOLVRIX_COMMIT != OLD_PRE_RWA_WOLVRIX_COMMIT

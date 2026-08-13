@@ -4,7 +4,7 @@
   "candidate_mode": "control",
   "hypothesis": "Pinned post-typed-state native-default control with no source modification or option override.",
   "evidence": [
-    "This fresh control pins parent b2fd50a4cac034cea8420835c6869d05cdde670c and wolvrix 79ec2037b00f2d4894d72785277ebe3f5d37782d.",
+    "This fresh control pins parent be78e837bce9c04973f28b8e6bcc5583447369da and wolvrix 79ec2037b00f2d4894d72785277ebe3f5d37782d.",
     "Native R lowers cold register-guard admission to 256 singleton guards or 2048 eligible writes with a 2048-write group cap and known-nonzero exclusion.",
     "Native W cold-hints only singleton MemoryWritePort guards inside an R-admitted run; memory writes do not admit a run.",
     "Native A nests an eligible adjacent SystemTask plus xs_assert_v2 DPIC pair under one outer unlikely guard while retaining the inner DPIC recheck.",

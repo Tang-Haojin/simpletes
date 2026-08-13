@@ -20,7 +20,7 @@ edges, PMU counters, and profiles are diagnostic evidence only. A change is
 useful only if the fixed-ASLR, functionally equivalent end-to-end run improves.
 
 This is the fresh post-typed-state baseline at parent
-`b2fd50a4cac034cea8420835c6869d05cdde670c` and Wolvrix
+`be78e837bce9c04973f28b8e6bcc5583447369da` and Wolvrix
 `79ec2037b00f2d4894d72785277ebe3f5d37782d`. R (cold register-guard
 admission and group hints), W (singleton MemoryWritePort hints inside an
 R-admitted run), and A (adjacent SystemTask plus `xs_assert_v2` outer-guard

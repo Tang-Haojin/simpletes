@@ -3,7 +3,7 @@
 This bench evolves a schema-v2 structured JSON candidate whose payload is a
 safe unified diff against the pinned `wolvrix` revision and whose
 `candidate_mode` declares its attribution path. The evaluator never edits the
-user checkout: it creates a locked local clone, verifies parent `b2fd50a` and
+user checkout: it creates a locked local clone, verifies parent `be78e83` and
 `wolvrix` `79ec203`, applies the patch only inside that slot, runs the
 mode-specific generated-source attribution gates, builds a real local ELF,
 runs fixed-ASLR function gates, and hands resolved artifacts to the trusted
@@ -173,7 +173,7 @@ tree and counters:
 The seed must be a regular, non-symlink file containing a complete marked
 schema-v2 candidate document. A checkpoint `best_program.txt` seed must also
 match a sibling node whose recorded parent/wolvrix pins equal this evaluator's
-new `b2fd50a`/`79ec203` pins. It is evaluated again as the new instance's
+new `be78e83`/`79ec203` pins. It is evaluated again as the new instance's
 initial node; that initial evaluation does not consume a proposal or
 valid-candidate slot.
 Omit `--resume` for this continuation so the launcher creates a fresh checkpoint
